@@ -1,0 +1,5040 @@
+diff -Nurp 4.9.0/integrity/digsig_asymmetric.c 4.19.98/integrity/digsig_asymmetric.c
+--- 4.9.0/integrity/digsig_asymmetric.c	2020-03-14 21:09:21.993540503 +0800
++++ 4.19.98/integrity/digsig_asymmetric.c	2020-03-14 20:52:04.881839999 +0800
+@@ -92,13 +92,13 @@ int asymmetric_verify(struct key *keyrin
+ 
+ 	siglen -= sizeof(*hdr);
+ 
+-	if (siglen != __be16_to_cpu(hdr->sig_size))
++	if (siglen != be16_to_cpu(hdr->sig_size))
+ 		return -EBADMSG;
+ 
+ 	if (hdr->hash_algo >= HASH_ALGO__LAST)
+ 		return -ENOPKG;
+ 
+-	key = request_asymmetric_key(keyring, __be32_to_cpu(hdr->keyid));
++	key = request_asymmetric_key(keyring, be32_to_cpu(hdr->keyid));
+ 	if (IS_ERR(key))
+ 		return PTR_ERR(key);
+ 
+@@ -115,3 +115,26 @@ int asymmetric_verify(struct key *keyrin
+ 	pr_debug("%s() = %d\n", __func__, ret);
+ 	return ret;
+ }
++
++/**
++ * integrity_kernel_module_request - prevent crypto-pkcs1pad(rsa,*) requests
++ * @kmod_name: kernel module name
++ *
++ * We have situation, when public_key_verify_signature() in case of RSA
++ * algorithm use alg_name to store internal information in order to
++ * construct an algorithm on the fly, but crypto_larval_lookup() will try
++ * to use alg_name in order to load kernel module with same name.
++ * Since we don't have any real "crypto-pkcs1pad(rsa,*)" kernel modules,
++ * we are safe to fail such module request from crypto_larval_lookup().
++ *
++ * In this way we prevent modprobe execution during digsig verification
++ * and avoid possible deadlock if modprobe and/or it's dependencies
++ * also signed with digsig.
++ */
++int integrity_kernel_module_request(char *kmod_name)
++{
++	if (strncmp(kmod_name, "crypto-pkcs1pad(rsa,", 20) == 0)
++		return -EINVAL;
++
++	return 0;
++}
+diff -Nurp 4.9.0/integrity/digsig.c 4.19.98/integrity/digsig.c
+--- 4.9.0/integrity/digsig.c	2020-03-14 21:09:21.993540503 +0800
++++ 4.19.98/integrity/digsig.c	2020-03-14 20:52:04.881839999 +0800
+@@ -18,6 +18,7 @@
+ #include <linux/cred.h>
+ #include <linux/key-type.h>
+ #include <linux/digsig.h>
++#include <linux/vmalloc.h>
+ #include <crypto/public_key.h>
+ #include <keys/system_keyring.h>
+ 
+@@ -51,7 +52,7 @@ static bool init_keyring __initdata;
+ int integrity_digsig_verify(const unsigned int id, const char *sig, int siglen,
+ 			    const char *digest, int digestlen)
+ {
+-	if (id >= INTEGRITY_KEYRING_MAX)
++	if (id >= INTEGRITY_KEYRING_MAX || siglen < 2)
+ 		return -EINVAL;
+ 
+ 	if (!keyring[id]) {
+@@ -81,18 +82,25 @@ int integrity_digsig_verify(const unsign
+ int __init integrity_init_keyring(const unsigned int id)
+ {
+ 	const struct cred *cred = current_cred();
++	struct key_restriction *restriction;
+ 	int err = 0;
+ 
+ 	if (!init_keyring)
+ 		return 0;
+ 
++	restriction = kzalloc(sizeof(struct key_restriction), GFP_KERNEL);
++	if (!restriction)
++		return -ENOMEM;
++
++	restriction->check = restrict_link_to_ima;
++
+ 	keyring[id] = keyring_alloc(keyring_name[id], KUIDT_INIT(0),
+ 				    KGIDT_INIT(0), cred,
+ 				    ((KEY_POS_ALL & ~KEY_POS_SETATTR) |
+ 				     KEY_USR_VIEW | KEY_USR_READ |
+ 				     KEY_USR_WRITE | KEY_USR_SEARCH),
+ 				    KEY_ALLOC_NOT_IN_QUOTA,
+-				    restrict_link_to_ima, NULL);
++				    restriction, NULL);
+ 	if (IS_ERR(keyring[id])) {
+ 		err = PTR_ERR(keyring[id]);
+ 		pr_info("Can't allocate %s keyring (%d)\n",
+@@ -105,21 +113,25 @@ int __init integrity_init_keyring(const
+ int __init integrity_load_x509(const unsigned int id, const char *path)
+ {
+ 	key_ref_t key;
+-	char *data;
++	void *data;
++	loff_t size;
+ 	int rc;
+ 
+ 	if (!keyring[id])
+ 		return -EINVAL;
+ 
+-	rc = integrity_read_file(path, &data);
+-	if (rc < 0)
++	rc = kernel_read_file_from_path(path, &data, &size, 0,
++					READING_X509_CERTIFICATE);
++	if (rc < 0) {
++		pr_err("Unable to open file: %s (%d)", path, rc);
+ 		return rc;
++	}
+ 
+ 	key = key_create_or_update(make_key_ref(keyring[id], 1),
+ 				   "asymmetric",
+ 				   NULL,
+ 				   data,
+-				   rc,
++				   size,
+ 				   ((KEY_POS_ALL & ~KEY_POS_SETATTR) |
+ 				    KEY_USR_VIEW | KEY_USR_READ),
+ 				   KEY_ALLOC_NOT_IN_QUOTA);
+@@ -132,6 +144,6 @@ int __init integrity_load_x509(const uns
+ 			  key_ref_to_ptr(key)->description, path);
+ 		key_ref_put(key);
+ 	}
+-	kfree(data);
++	vfree(data);
+ 	return 0;
+ }
+diff -Nurp 4.9.0/integrity/evm/evm_crypto.c 4.19.98/integrity/evm/evm_crypto.c
+--- 4.9.0/integrity/evm/evm_crypto.c	2020-03-14 21:09:21.993540503 +0800
++++ 4.19.98/integrity/evm/evm_crypto.c	2020-03-14 20:52:04.881839999 +0800
+@@ -21,6 +21,7 @@
+ #include <linux/evm.h>
+ #include <keys/encrypted-type.h>
+ #include <crypto/hash.h>
++#include <crypto/hash_info.h>
+ #include "evm.h"
+ 
+ #define EVMKEY "evm-key"
+@@ -29,7 +30,7 @@ static unsigned char evmkey[MAX_KEY_SIZE
+ static int evmkey_len = MAX_KEY_SIZE;
+ 
+ struct crypto_shash *hmac_tfm;
+-struct crypto_shash *hash_tfm;
++static struct crypto_shash *evm_tfm[HASH_ALGO__LAST];
+ 
+ static DEFINE_MUTEX(mutex);
+ 
+@@ -37,6 +38,8 @@ static DEFINE_MUTEX(mutex);
+ 
+ static unsigned long evm_set_key_flags;
+ 
++static char * const evm_hmac = "hmac(sha1)";
++
+ /**
+  * evm_set_key() - set EVM HMAC key from the kernel
+  * @key: pointer to a buffer with the key data
+@@ -71,30 +74,34 @@ busy:
+ }
+ EXPORT_SYMBOL_GPL(evm_set_key);
+ 
+-static struct shash_desc *init_desc(char type)
++static struct shash_desc *init_desc(char type, uint8_t hash_algo)
+ {
+ 	long rc;
+-	char *algo;
++	const char *algo;
+ 	struct crypto_shash **tfm;
+ 	struct shash_desc *desc;
+ 
+ 	if (type == EVM_XATTR_HMAC) {
+ 		if (!(evm_initialized & EVM_INIT_HMAC)) {
+-			pr_err("HMAC key is not set\n");
++			pr_err_once("HMAC key is not set\n");
+ 			return ERR_PTR(-ENOKEY);
+ 		}
+ 		tfm = &hmac_tfm;
+ 		algo = evm_hmac;
+ 	} else {
+-		tfm = &hash_tfm;
+-		algo = evm_hash;
++		if (hash_algo >= HASH_ALGO__LAST)
++			return ERR_PTR(-EINVAL);
++
++		tfm = &evm_tfm[hash_algo];
++		algo = hash_algo_name[hash_algo];
+ 	}
+ 
+ 	if (*tfm == NULL) {
+ 		mutex_lock(&mutex);
+ 		if (*tfm)
+ 			goto out;
+-		*tfm = crypto_alloc_shash(algo, 0, CRYPTO_ALG_ASYNC);
++		*tfm = crypto_alloc_shash(algo, 0,
++					  CRYPTO_ALG_ASYNC | CRYPTO_NOLOAD);
+ 		if (IS_ERR(*tfm)) {
+ 			rc = PTR_ERR(*tfm);
+ 			pr_err("Can not allocate %s (reason: %ld)\n", algo, rc);
+@@ -138,7 +145,7 @@ out:
+  * protection.)
+  */
+ static void hmac_add_misc(struct shash_desc *desc, struct inode *inode,
+-			  char *digest)
++			  char type, char *digest)
+ {
+ 	struct h_misc {
+ 		unsigned long ino;
+@@ -149,14 +156,28 @@ static void hmac_add_misc(struct shash_d
+ 	} hmac_misc;
+ 
+ 	memset(&hmac_misc, 0, sizeof(hmac_misc));
+-	hmac_misc.ino = inode->i_ino;
+-	hmac_misc.generation = inode->i_generation;
+-	hmac_misc.uid = from_kuid(inode->i_sb->s_user_ns, inode->i_uid);
+-	hmac_misc.gid = from_kgid(inode->i_sb->s_user_ns, inode->i_gid);
++	/* Don't include the inode or generation number in portable
++	 * signatures
++	 */
++	if (type != EVM_XATTR_PORTABLE_DIGSIG) {
++		hmac_misc.ino = inode->i_ino;
++		hmac_misc.generation = inode->i_generation;
++	}
++	/* The hmac uid and gid must be encoded in the initial user
++	 * namespace (not the filesystems user namespace) as encoding
++	 * them in the filesystems user namespace allows an attack
++	 * where first they are written in an unprivileged fuse mount
++	 * of a filesystem and then the system is tricked to mount the
++	 * filesystem for real on next boot and trust it because
++	 * everything is signed.
++	 */
++	hmac_misc.uid = from_kuid(&init_user_ns, inode->i_uid);
++	hmac_misc.gid = from_kgid(&init_user_ns, inode->i_gid);
+ 	hmac_misc.mode = inode->i_mode;
+ 	crypto_shash_update(desc, (const u8 *)&hmac_misc, sizeof(hmac_misc));
+-	if (evm_hmac_attrs & EVM_ATTR_FSUUID)
+-		crypto_shash_update(desc, inode->i_sb->s_uuid,
++	if ((evm_hmac_attrs & EVM_ATTR_FSUUID) &&
++	    type != EVM_XATTR_PORTABLE_DIGSIG)
++		crypto_shash_update(desc, &inode->i_sb->s_uuid.b[0],
+ 				    sizeof(inode->i_sb->s_uuid));
+ 	crypto_shash_final(desc, digest);
+ }
+@@ -169,36 +190,47 @@ static void hmac_add_misc(struct shash_d
+  * each xattr, but attempt to re-use the previously allocated memory.
+  */
+ static int evm_calc_hmac_or_hash(struct dentry *dentry,
+-				const char *req_xattr_name,
+-				const char *req_xattr_value,
+-				size_t req_xattr_value_len,
+-				char type, char *digest)
++				 const char *req_xattr_name,
++				 const char *req_xattr_value,
++				 size_t req_xattr_value_len,
++				 uint8_t type, struct evm_digest *data)
+ {
+ 	struct inode *inode = d_backing_inode(dentry);
++	struct xattr_list *xattr;
+ 	struct shash_desc *desc;
+-	char **xattrname;
+ 	size_t xattr_size = 0;
+ 	char *xattr_value = NULL;
+ 	int error;
+ 	int size;
++	bool ima_present = false;
+ 
+-	if (!(inode->i_opflags & IOP_XATTR))
++	if (!(inode->i_opflags & IOP_XATTR) ||
++	    inode->i_sb->s_user_ns != &init_user_ns)
+ 		return -EOPNOTSUPP;
+ 
+-	desc = init_desc(type);
++	desc = init_desc(type, data->hdr.algo);
+ 	if (IS_ERR(desc))
+ 		return PTR_ERR(desc);
+ 
++	data->hdr.length = crypto_shash_digestsize(desc->tfm);
++
+ 	error = -ENODATA;
+-	for (xattrname = evm_config_xattrnames; *xattrname != NULL; xattrname++) {
++	list_for_each_entry_rcu(xattr, &evm_config_xattrnames, list) {
++		bool is_ima = false;
++
++		if (strcmp(xattr->name, XATTR_NAME_IMA) == 0)
++			is_ima = true;
++
+ 		if ((req_xattr_name && req_xattr_value)
+-		    && !strcmp(*xattrname, req_xattr_name)) {
++		    && !strcmp(xattr->name, req_xattr_name)) {
+ 			error = 0;
+ 			crypto_shash_update(desc, (const u8 *)req_xattr_value,
+ 					     req_xattr_value_len);
++			if (is_ima)
++				ima_present = true;
+ 			continue;
+ 		}
+-		size = vfs_getxattr_alloc(dentry, *xattrname,
++		size = vfs_getxattr_alloc(dentry, xattr->name,
+ 					  &xattr_value, xattr_size, GFP_NOFS);
+ 		if (size == -ENOMEM) {
+ 			error = -ENOMEM;
+@@ -210,9 +242,14 @@ static int evm_calc_hmac_or_hash(struct
+ 		error = 0;
+ 		xattr_size = size;
+ 		crypto_shash_update(desc, (const u8 *)xattr_value, xattr_size);
++		if (is_ima)
++			ima_present = true;
+ 	}
+-	hmac_add_misc(desc, inode, digest);
++	hmac_add_misc(desc, inode, type, data->digest);
+ 
++	/* Portable EVM signatures must include an IMA hash */
++	if (type == EVM_XATTR_PORTABLE_DIGSIG && !ima_present)
++		return -EPERM;
+ out:
+ 	kfree(xattr_value);
+ 	kfree(desc);
+@@ -221,20 +258,48 @@ out:
+ 
+ int evm_calc_hmac(struct dentry *dentry, const char *req_xattr_name,
+ 		  const char *req_xattr_value, size_t req_xattr_value_len,
+-		  char *digest)
++		  struct evm_digest *data)
+ {
+ 	return evm_calc_hmac_or_hash(dentry, req_xattr_name, req_xattr_value,
+-				req_xattr_value_len, EVM_XATTR_HMAC, digest);
++				    req_xattr_value_len, EVM_XATTR_HMAC, data);
+ }
+ 
+ int evm_calc_hash(struct dentry *dentry, const char *req_xattr_name,
+ 		  const char *req_xattr_value, size_t req_xattr_value_len,
+-		  char *digest)
++		  char type, struct evm_digest *data)
+ {
+ 	return evm_calc_hmac_or_hash(dentry, req_xattr_name, req_xattr_value,
+-				req_xattr_value_len, IMA_XATTR_DIGEST, digest);
++				     req_xattr_value_len, type, data);
++}
++
++static int evm_is_immutable(struct dentry *dentry, struct inode *inode)
++{
++	const struct evm_ima_xattr_data *xattr_data = NULL;
++	struct integrity_iint_cache *iint;
++	int rc = 0;
++
++	iint = integrity_iint_find(inode);
++	if (iint && (iint->flags & EVM_IMMUTABLE_DIGSIG))
++		return 1;
++
++	/* Do this the hard way */
++	rc = vfs_getxattr_alloc(dentry, XATTR_NAME_EVM, (char **)&xattr_data, 0,
++				GFP_NOFS);
++	if (rc <= 0) {
++		if (rc == -ENODATA)
++			return 0;
++		return rc;
++	}
++	if (xattr_data->type == EVM_XATTR_PORTABLE_DIGSIG)
++		rc = 1;
++	else
++		rc = 0;
++
++	kfree(xattr_data);
++	return rc;
+ }
+ 
++
+ /*
+  * Calculate the hmac and update security.evm xattr
+  *
+@@ -244,16 +309,27 @@ int evm_update_evmxattr(struct dentry *d
+ 			const char *xattr_value, size_t xattr_value_len)
+ {
+ 	struct inode *inode = d_backing_inode(dentry);
+-	struct evm_ima_xattr_data xattr_data;
++	struct evm_digest data;
+ 	int rc = 0;
+ 
++	/*
++	 * Don't permit any transformation of the EVM xattr if the signature
++	 * is of an immutable type
++	 */
++	rc = evm_is_immutable(dentry, inode);
++	if (rc < 0)
++		return rc;
++	if (rc)
++		return -EPERM;
++
++	data.hdr.algo = HASH_ALGO_SHA1;
+ 	rc = evm_calc_hmac(dentry, xattr_name, xattr_value,
+-			   xattr_value_len, xattr_data.digest);
++			   xattr_value_len, &data);
+ 	if (rc == 0) {
+-		xattr_data.type = EVM_XATTR_HMAC;
++		data.hdr.xattr.sha1.type = EVM_XATTR_HMAC;
+ 		rc = __vfs_setxattr_noperm(dentry, XATTR_NAME_EVM,
+-					   &xattr_data,
+-					   sizeof(xattr_data), 0);
++					   &data.hdr.xattr.data[1],
++					   SHA1_DIGEST_SIZE + 1, 0);
+ 	} else if (rc == -ENODATA && (inode->i_opflags & IOP_XATTR)) {
+ 		rc = __vfs_removexattr(dentry, XATTR_NAME_EVM);
+ 	}
+@@ -265,14 +341,14 @@ int evm_init_hmac(struct inode *inode, c
+ {
+ 	struct shash_desc *desc;
+ 
+-	desc = init_desc(EVM_XATTR_HMAC);
++	desc = init_desc(EVM_XATTR_HMAC, HASH_ALGO_SHA1);
+ 	if (IS_ERR(desc)) {
+ 		pr_info("init_desc failed\n");
+ 		return PTR_ERR(desc);
+ 	}
+ 
+ 	crypto_shash_update(desc, lsm_xattr->value, lsm_xattr->value_len);
+-	hmac_add_misc(desc, inode, hmac_val);
++	hmac_add_misc(desc, inode, EVM_XATTR_HMAC, hmac_val);
+ 	kfree(desc);
+ 	return 0;
+ }
+diff -Nurp 4.9.0/integrity/evm/evm.h 4.19.98/integrity/evm/evm.h
+--- 4.9.0/integrity/evm/evm.h	2020-03-14 21:09:21.993540503 +0800
++++ 4.19.98/integrity/evm/evm.h	2020-03-14 20:52:04.881839999 +0800
+@@ -23,10 +23,19 @@
+ 
+ #define EVM_INIT_HMAC	0x0001
+ #define EVM_INIT_X509	0x0002
++#define EVM_ALLOW_METADATA_WRITES	0x0004
++#define EVM_SETUP_COMPLETE 0x80000000 /* userland has signaled key load */
++
++#define EVM_KEY_MASK (EVM_INIT_HMAC | EVM_INIT_X509)
++#define EVM_INIT_MASK (EVM_INIT_HMAC | EVM_INIT_X509 | EVM_SETUP_COMPLETE | \
++		       EVM_ALLOW_METADATA_WRITES)
++
++struct xattr_list {
++	struct list_head list;
++	char *name;
++};
+ 
+ extern int evm_initialized;
+-extern char *evm_hmac;
+-extern char *evm_hash;
+ 
+ #define EVM_ATTR_FSUUID		0x0001
+ 
+@@ -36,7 +45,12 @@ extern struct crypto_shash *hmac_tfm;
+ extern struct crypto_shash *hash_tfm;
+ 
+ /* List of EVM protected security xattrs */
+-extern char *evm_config_xattrnames[];
++extern struct list_head evm_config_xattrnames;
++
++struct evm_digest {
++	struct ima_digest_data hdr;
++	char digest[IMA_MAX_DIGEST_SIZE];
++} __packed;
+ 
+ int evm_init_key(void);
+ int evm_update_evmxattr(struct dentry *dentry,
+@@ -45,10 +59,11 @@ int evm_update_evmxattr(struct dentry *d
+ 			size_t req_xattr_value_len);
+ int evm_calc_hmac(struct dentry *dentry, const char *req_xattr_name,
+ 		  const char *req_xattr_value,
+-		  size_t req_xattr_value_len, char *digest);
++		  size_t req_xattr_value_len, struct evm_digest *data);
+ int evm_calc_hash(struct dentry *dentry, const char *req_xattr_name,
+ 		  const char *req_xattr_value,
+-		  size_t req_xattr_value_len, char *digest);
++		  size_t req_xattr_value_len, char type,
++		  struct evm_digest *data);
+ int evm_init_hmac(struct inode *inode, const struct xattr *xattr,
+ 		  char *hmac_val);
+ int evm_init_secfs(void);
+diff -Nurp 4.9.0/integrity/evm/evm_main.c 4.19.98/integrity/evm/evm_main.c
+--- 4.9.0/integrity/evm/evm_main.c	2020-03-14 21:09:21.993540503 +0800
++++ 4.19.98/integrity/evm/evm_main.c	2020-03-14 20:52:04.881839999 +0800
+@@ -22,38 +22,43 @@
+ #include <linux/xattr.h>
+ #include <linux/integrity.h>
+ #include <linux/evm.h>
++#include <linux/magic.h>
++
+ #include <crypto/hash.h>
++#include <crypto/hash_info.h>
+ #include <crypto/algapi.h>
+ #include "evm.h"
+ 
+ int evm_initialized;
+ 
+-static char *integrity_status_msg[] = {
+-	"pass", "fail", "no_label", "no_xattrs", "unknown"
++static const char * const integrity_status_msg[] = {
++	"pass", "pass_immutable", "fail", "no_label", "no_xattrs", "unknown"
+ };
+-char *evm_hmac = "hmac(sha1)";
+-char *evm_hash = "sha1";
+ int evm_hmac_attrs;
+ 
+-char *evm_config_xattrnames[] = {
++static struct xattr_list evm_config_default_xattrnames[] = {
+ #ifdef CONFIG_SECURITY_SELINUX
+-	XATTR_NAME_SELINUX,
++	{.name = XATTR_NAME_SELINUX},
+ #endif
+ #ifdef CONFIG_SECURITY_SMACK
+-	XATTR_NAME_SMACK,
++	{.name = XATTR_NAME_SMACK},
+ #ifdef CONFIG_EVM_EXTRA_SMACK_XATTRS
+-	XATTR_NAME_SMACKEXEC,
+-	XATTR_NAME_SMACKTRANSMUTE,
+-	XATTR_NAME_SMACKMMAP,
++	{.name = XATTR_NAME_SMACKEXEC},
++	{.name = XATTR_NAME_SMACKTRANSMUTE},
++	{.name = XATTR_NAME_SMACKMMAP},
++#endif
+ #endif
++#ifdef CONFIG_SECURITY_APPARMOR
++	{.name = XATTR_NAME_APPARMOR},
+ #endif
+ #ifdef CONFIG_IMA_APPRAISE
+-	XATTR_NAME_IMA,
++	{.name = XATTR_NAME_IMA},
+ #endif
+-	XATTR_NAME_CAPS,
+-	NULL
++	{.name = XATTR_NAME_CAPS},
+ };
+ 
++LIST_HEAD(evm_config_xattrnames);
++
+ static int evm_fixmode;
+ static int __init evm_set_fixmode(char *str)
+ {
+@@ -65,24 +70,40 @@ __setup("evm=", evm_set_fixmode);
+ 
+ static void __init evm_init_config(void)
+ {
++	int i, xattrs;
++
++	xattrs = ARRAY_SIZE(evm_config_default_xattrnames);
++
++	pr_info("Initialising EVM extended attributes:\n");
++	for (i = 0; i < xattrs; i++) {
++		pr_info("%s\n", evm_config_default_xattrnames[i].name);
++		list_add_tail(&evm_config_default_xattrnames[i].list,
++			      &evm_config_xattrnames);
++	}
++
+ #ifdef CONFIG_EVM_ATTR_FSUUID
+ 	evm_hmac_attrs |= EVM_ATTR_FSUUID;
+ #endif
+ 	pr_info("HMAC attrs: 0x%x\n", evm_hmac_attrs);
+ }
+ 
++static bool evm_key_loaded(void)
++{
++	return (bool)(evm_initialized & EVM_KEY_MASK);
++}
++
+ static int evm_find_protected_xattrs(struct dentry *dentry)
+ {
+ 	struct inode *inode = d_backing_inode(dentry);
+-	char **xattr;
++	struct xattr_list *xattr;
+ 	int error;
+ 	int count = 0;
+ 
+ 	if (!(inode->i_opflags & IOP_XATTR))
+ 		return -EOPNOTSUPP;
+ 
+-	for (xattr = evm_config_xattrnames; *xattr != NULL; xattr++) {
+-		error = __vfs_getxattr(dentry, inode, *xattr, NULL, 0);
++	list_for_each_entry_rcu(xattr, &evm_config_xattrnames, list) {
++		error = __vfs_getxattr(dentry, inode, xattr->name, NULL, 0);
+ 		if (error < 0) {
+ 			if (error == -ENODATA)
+ 				continue;
+@@ -114,11 +135,14 @@ static enum integrity_status evm_verify_
+ 					     struct integrity_iint_cache *iint)
+ {
+ 	struct evm_ima_xattr_data *xattr_data = NULL;
+-	struct evm_ima_xattr_data calc;
++	struct signature_v2_hdr *hdr;
+ 	enum integrity_status evm_status = INTEGRITY_PASS;
++	struct evm_digest digest;
++	struct inode *inode;
+ 	int rc, xattr_len;
+ 
+-	if (iint && iint->evm_status == INTEGRITY_PASS)
++	if (iint && (iint->evm_status == INTEGRITY_PASS ||
++		     iint->evm_status == INTEGRITY_PASS_IMMUTABLE))
+ 		return iint->evm_status;
+ 
+ 	/* if status is not PASS, try to check again - against -ENOMEM */
+@@ -145,32 +169,46 @@ static enum integrity_status evm_verify_
+ 	/* check value type */
+ 	switch (xattr_data->type) {
+ 	case EVM_XATTR_HMAC:
++		if (xattr_len != sizeof(struct evm_ima_xattr_data)) {
++			evm_status = INTEGRITY_FAIL;
++			goto out;
++		}
++
++		digest.hdr.algo = HASH_ALGO_SHA1;
+ 		rc = evm_calc_hmac(dentry, xattr_name, xattr_value,
+-				   xattr_value_len, calc.digest);
++				   xattr_value_len, &digest);
+ 		if (rc)
+ 			break;
+-		rc = crypto_memneq(xattr_data->digest, calc.digest,
+-			    sizeof(calc.digest));
++		rc = crypto_memneq(xattr_data->digest, digest.digest,
++				   SHA1_DIGEST_SIZE);
+ 		if (rc)
+ 			rc = -EINVAL;
+ 		break;
+ 	case EVM_IMA_XATTR_DIGSIG:
++	case EVM_XATTR_PORTABLE_DIGSIG:
++		hdr = (struct signature_v2_hdr *)xattr_data;
++		digest.hdr.algo = hdr->hash_algo;
+ 		rc = evm_calc_hash(dentry, xattr_name, xattr_value,
+-				xattr_value_len, calc.digest);
++				   xattr_value_len, xattr_data->type, &digest);
+ 		if (rc)
+ 			break;
+ 		rc = integrity_digsig_verify(INTEGRITY_KEYRING_EVM,
+ 					(const char *)xattr_data, xattr_len,
+-					calc.digest, sizeof(calc.digest));
++					digest.digest, digest.hdr.length);
+ 		if (!rc) {
+-			/* Replace RSA with HMAC if not mounted readonly and
+-			 * not immutable
+-			 */
+-			if (!IS_RDONLY(d_backing_inode(dentry)) &&
+-			    !IS_IMMUTABLE(d_backing_inode(dentry)))
++			inode = d_backing_inode(dentry);
++
++			if (xattr_data->type == EVM_XATTR_PORTABLE_DIGSIG) {
++				if (iint)
++					iint->flags |= EVM_IMMUTABLE_DIGSIG;
++				evm_status = INTEGRITY_PASS_IMMUTABLE;
++			} else if (!IS_RDONLY(inode) &&
++				   !(inode->i_sb->s_readonly_remount) &&
++				   !IS_IMMUTABLE(inode)) {
+ 				evm_update_evmxattr(dentry, xattr_name,
+ 						    xattr_value,
+ 						    xattr_value_len);
++			}
+ 		}
+ 		break;
+ 	default:
+@@ -190,24 +228,25 @@ out:
+ 
+ static int evm_protected_xattr(const char *req_xattr_name)
+ {
+-	char **xattrname;
+ 	int namelen;
+ 	int found = 0;
++	struct xattr_list *xattr;
+ 
+ 	namelen = strlen(req_xattr_name);
+-	for (xattrname = evm_config_xattrnames; *xattrname != NULL; xattrname++) {
+-		if ((strlen(*xattrname) == namelen)
+-		    && (strncmp(req_xattr_name, *xattrname, namelen) == 0)) {
++	list_for_each_entry_rcu(xattr, &evm_config_xattrnames, list) {
++		if ((strlen(xattr->name) == namelen)
++		    && (strncmp(req_xattr_name, xattr->name, namelen) == 0)) {
+ 			found = 1;
+ 			break;
+ 		}
+ 		if (strncmp(req_xattr_name,
+-			    *xattrname + XATTR_SECURITY_PREFIX_LEN,
++			    xattr->name + XATTR_SECURITY_PREFIX_LEN,
+ 			    strlen(req_xattr_name)) == 0) {
+ 			found = 1;
+ 			break;
+ 		}
+ 	}
++
+ 	return found;
+ }
+ 
+@@ -232,7 +271,7 @@ enum integrity_status evm_verifyxattr(st
+ 				      void *xattr_value, size_t xattr_value_len,
+ 				      struct integrity_iint_cache *iint)
+ {
+-	if (!evm_initialized || !evm_protected_xattr(xattr_name))
++	if (!evm_key_loaded() || !evm_protected_xattr(xattr_name))
+ 		return INTEGRITY_UNKNOWN;
+ 
+ 	if (!iint) {
+@@ -256,7 +295,7 @@ static enum integrity_status evm_verify_
+ {
+ 	struct inode *inode = d_backing_inode(dentry);
+ 
+-	if (!evm_initialized || !S_ISREG(inode->i_mode) || evm_fixmode)
++	if (!evm_key_loaded() || !S_ISREG(inode->i_mode) || evm_fixmode)
+ 		return 0;
+ 	return evm_verify_hmac(dentry, NULL, NULL, 0, NULL);
+ }
+@@ -271,7 +310,7 @@ static enum integrity_status evm_verify_
+  * affect security.evm.  An interesting side affect of writing posix xattr
+  * acls is their modifying of the i_mode, which is included in security.evm.
+  * For posix xattr acls only, permit security.evm, even if it currently
+- * doesn't exist, to be updated.
++ * doesn't exist, to be updated unless the EVM signature is immutable.
+  */
+ static int evm_protect_xattr(struct dentry *dentry, const char *xattr_name,
+ 			     const void *xattr_value, size_t xattr_value_len)
+@@ -290,6 +329,7 @@ static int evm_protect_xattr(struct dent
+ 			return 0;
+ 		goto out;
+ 	}
++
+ 	evm_status = evm_verify_current_integrity(dentry);
+ 	if (evm_status == INTEGRITY_NOXATTRS) {
+ 		struct integrity_iint_cache *iint;
+@@ -336,10 +376,17 @@ int evm_inode_setxattr(struct dentry *de
+ {
+ 	const struct evm_ima_xattr_data *xattr_data = xattr_value;
+ 
++	/* Policy permits modification of the protected xattrs even though
++	 * there's no HMAC key loaded
++	 */
++	if (evm_initialized & EVM_ALLOW_METADATA_WRITES)
++		return 0;
++
+ 	if (strcmp(xattr_name, XATTR_NAME_EVM) == 0) {
+ 		if (!xattr_value_len)
+ 			return -EINVAL;
+-		if (xattr_data->type != EVM_IMA_XATTR_DIGSIG)
++		if (xattr_data->type != EVM_IMA_XATTR_DIGSIG &&
++		    xattr_data->type != EVM_XATTR_PORTABLE_DIGSIG)
+ 			return -EPERM;
+ 	}
+ 	return evm_protect_xattr(dentry, xattr_name, xattr_value,
+@@ -356,6 +403,12 @@ int evm_inode_setxattr(struct dentry *de
+  */
+ int evm_inode_removexattr(struct dentry *dentry, const char *xattr_name)
+ {
++	/* Policy permits modification of the protected xattrs even though
++	 * there's no HMAC key loaded
++	 */
++	if (evm_initialized & EVM_ALLOW_METADATA_WRITES)
++		return 0;
++
+ 	return evm_protect_xattr(dentry, xattr_name, NULL, 0);
+ }
+ 
+@@ -384,8 +437,8 @@ static void evm_reset_status(struct inod
+ void evm_inode_post_setxattr(struct dentry *dentry, const char *xattr_name,
+ 			     const void *xattr_value, size_t xattr_value_len)
+ {
+-	if (!evm_initialized || (!evm_protected_xattr(xattr_name)
+-				 && !posix_xattr_acl(xattr_name)))
++	if (!evm_key_loaded() || (!evm_protected_xattr(xattr_name)
++				  && !posix_xattr_acl(xattr_name)))
+ 		return;
+ 
+ 	evm_reset_status(dentry->d_inode);
+@@ -405,7 +458,7 @@ void evm_inode_post_setxattr(struct dent
+  */
+ void evm_inode_post_removexattr(struct dentry *dentry, const char *xattr_name)
+ {
+-	if (!evm_initialized || !evm_protected_xattr(xattr_name))
++	if (!evm_key_loaded() || !evm_protected_xattr(xattr_name))
+ 		return;
+ 
+ 	evm_reset_status(dentry->d_inode);
+@@ -416,12 +469,21 @@ void evm_inode_post_removexattr(struct d
+ /**
+  * evm_inode_setattr - prevent updating an invalid EVM extended attribute
+  * @dentry: pointer to the affected dentry
++ *
++ * Permit update of file attributes when files have a valid EVM signature,
++ * except in the case of them having an immutable portable signature.
+  */
+ int evm_inode_setattr(struct dentry *dentry, struct iattr *attr)
+ {
+ 	unsigned int ia_valid = attr->ia_valid;
+ 	enum integrity_status evm_status;
+ 
++	/* Policy permits modification of the protected attrs even though
++	 * there's no HMAC key loaded
++	 */
++	if (evm_initialized & EVM_ALLOW_METADATA_WRITES)
++		return 0;
++
+ 	if (!(ia_valid & (ATTR_MODE | ATTR_UID | ATTR_GID)))
+ 		return 0;
+ 	evm_status = evm_verify_current_integrity(dentry);
+@@ -447,7 +509,7 @@ int evm_inode_setattr(struct dentry *den
+  */
+ void evm_inode_post_setattr(struct dentry *dentry, int ia_valid)
+ {
+-	if (!evm_initialized)
++	if (!evm_key_loaded())
+ 		return;
+ 
+ 	if (ia_valid & (ATTR_MODE | ATTR_UID | ATTR_GID))
+@@ -464,7 +526,7 @@ int evm_inode_init_security(struct inode
+ 	struct evm_ima_xattr_data *xattr_data;
+ 	int rc;
+ 
+-	if (!evm_initialized || !evm_protected_xattr(lsm_xattr->name))
++	if (!evm_key_loaded() || !evm_protected_xattr(lsm_xattr->name))
+ 		return 0;
+ 
+ 	xattr_data = kzalloc(sizeof(*xattr_data), GFP_NOFS);
+@@ -500,35 +562,35 @@ void __init evm_load_x509(void)
+ static int __init init_evm(void)
+ {
+ 	int error;
++	struct list_head *pos, *q;
++	struct xattr_list *xattr;
+ 
+ 	evm_init_config();
+ 
+ 	error = integrity_init_keyring(INTEGRITY_KEYRING_EVM);
+ 	if (error)
+-		return error;
++		goto error;
+ 
+ 	error = evm_init_secfs();
+ 	if (error < 0) {
+ 		pr_info("Error registering secfs\n");
+-		return error;
++		goto error;
+ 	}
+ 
+-	return 0;
+-}
+-
+-/*
+- * evm_display_config - list the EVM protected security extended attributes
+- */
+-static int __init evm_display_config(void)
+-{
+-	char **xattrname;
++error:
++	if (error != 0) {
++		if (!list_empty(&evm_config_xattrnames)) {
++			list_for_each_safe(pos, q, &evm_config_xattrnames) {
++				xattr = list_entry(pos, struct xattr_list,
++						   list);
++				list_del(pos);
++			}
++		}
++	}
+ 
+-	for (xattrname = evm_config_xattrnames; *xattrname != NULL; xattrname++)
+-		pr_info("%s\n", *xattrname);
+-	return 0;
++	return error;
+ }
+ 
+-pure_initcall(evm_display_config);
+ late_initcall(init_evm);
+ 
+ MODULE_DESCRIPTION("Extended Verification Module");
+diff -Nurp 4.9.0/integrity/evm/evm_secfs.c 4.19.98/integrity/evm/evm_secfs.c
+--- 4.9.0/integrity/evm/evm_secfs.c	2020-03-14 21:09:21.993540503 +0800
++++ 4.19.98/integrity/evm/evm_secfs.c	2020-03-14 20:52:04.881839999 +0800
+@@ -15,11 +15,21 @@
+ 
+ #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+ 
++#include <linux/audit.h>
+ #include <linux/uaccess.h>
+ #include <linux/module.h>
++#include <linux/mutex.h>
+ #include "evm.h"
+ 
++static struct dentry *evm_dir;
+ static struct dentry *evm_init_tpm;
++static struct dentry *evm_symlink;
++
++#ifdef CONFIG_EVM_ADD_XATTRS
++static struct dentry *evm_xattrs;
++static DEFINE_MUTEX(xattr_list_mutex);
++static int evm_xattrs_locked;
++#endif
+ 
+ /**
+  * evm_read_key - read() for <securityfs>/evm
+@@ -40,7 +50,7 @@ static ssize_t evm_read_key(struct file
+ 	if (*ppos != 0)
+ 		return 0;
+ 
+-	sprintf(temp, "%d", evm_initialized);
++	sprintf(temp, "%d", (evm_initialized & ~EVM_SETUP_COMPLETE));
+ 	rc = simple_read_from_buffer(buf, count, ppos, temp, strlen(temp));
+ 
+ 	return rc;
+@@ -61,24 +71,43 @@ static ssize_t evm_read_key(struct file
+ static ssize_t evm_write_key(struct file *file, const char __user *buf,
+ 			     size_t count, loff_t *ppos)
+ {
+-	char temp[80];
+-	int i;
++	int i, ret;
+ 
+-	if (!capable(CAP_SYS_ADMIN) || (evm_initialized & EVM_INIT_HMAC))
++	if (!capable(CAP_SYS_ADMIN) || (evm_initialized & EVM_SETUP_COMPLETE))
+ 		return -EPERM;
+ 
+-	if (count >= sizeof(temp) || count == 0)
+-		return -EINVAL;
+-
+-	if (copy_from_user(temp, buf, count) != 0)
+-		return -EFAULT;
++	ret = kstrtoint_from_user(buf, count, 0, &i);
+ 
+-	temp[count] = '\0';
++	if (ret)
++		return ret;
+ 
+-	if ((sscanf(temp, "%d", &i) != 1) || (i != 1))
++	/* Reject invalid values */
++	if (!i || (i & ~EVM_INIT_MASK) != 0)
+ 		return -EINVAL;
+ 
+-	evm_init_key();
++	/* Don't allow a request to freshly enable metadata writes if
++	 * keys are loaded.
++	 */
++	if ((i & EVM_ALLOW_METADATA_WRITES) &&
++	    ((evm_initialized & EVM_KEY_MASK) != 0) &&
++	    !(evm_initialized & EVM_ALLOW_METADATA_WRITES))
++		return -EPERM;
++
++	if (i & EVM_INIT_HMAC) {
++		ret = evm_init_key();
++		if (ret != 0)
++			return ret;
++		/* Forbid further writes after the symmetric key is loaded */
++		i |= EVM_SETUP_COMPLETE;
++	}
++
++	evm_initialized |= i;
++
++	/* Don't allow protected metadata modification if a symmetric key
++	 * is loaded
++	 */
++	if (evm_initialized & EVM_INIT_HMAC)
++		evm_initialized &= ~(EVM_ALLOW_METADATA_WRITES);
+ 
+ 	return count;
+ }
+@@ -88,13 +117,203 @@ static const struct file_operations evm_
+ 	.write		= evm_write_key,
+ };
+ 
++#ifdef CONFIG_EVM_ADD_XATTRS
++/**
++ * evm_read_xattrs - read() for <securityfs>/evm_xattrs
++ *
++ * @filp: file pointer, not actually used
++ * @buf: where to put the result
++ * @count: maximum to send along
++ * @ppos: where to start
++ *
++ * Returns number of bytes read or error code, as appropriate
++ */
++static ssize_t evm_read_xattrs(struct file *filp, char __user *buf,
++			       size_t count, loff_t *ppos)
++{
++	char *temp;
++	int offset = 0;
++	ssize_t rc, size = 0;
++	struct xattr_list *xattr;
++
++	if (*ppos != 0)
++		return 0;
++
++	rc = mutex_lock_interruptible(&xattr_list_mutex);
++	if (rc)
++		return -ERESTARTSYS;
++
++	list_for_each_entry(xattr, &evm_config_xattrnames, list)
++		size += strlen(xattr->name) + 1;
++
++	temp = kmalloc(size + 1, GFP_KERNEL);
++	if (!temp) {
++		mutex_unlock(&xattr_list_mutex);
++		return -ENOMEM;
++	}
++
++	list_for_each_entry(xattr, &evm_config_xattrnames, list) {
++		sprintf(temp + offset, "%s\n", xattr->name);
++		offset += strlen(xattr->name) + 1;
++	}
++
++	mutex_unlock(&xattr_list_mutex);
++	rc = simple_read_from_buffer(buf, count, ppos, temp, strlen(temp));
++
++	kfree(temp);
++
++	return rc;
++}
++
++/**
++ * evm_write_xattrs - write() for <securityfs>/evm_xattrs
++ * @file: file pointer, not actually used
++ * @buf: where to get the data from
++ * @count: bytes sent
++ * @ppos: where to start
++ *
++ * Returns number of bytes written or error code, as appropriate
++ */
++static ssize_t evm_write_xattrs(struct file *file, const char __user *buf,
++				size_t count, loff_t *ppos)
++{
++	int len, err;
++	struct xattr_list *xattr, *tmp;
++	struct audit_buffer *ab;
++	struct iattr newattrs;
++	struct inode *inode;
++
++	if (!capable(CAP_SYS_ADMIN) || evm_xattrs_locked)
++		return -EPERM;
++
++	if (*ppos != 0)
++		return -EINVAL;
++
++	if (count > XATTR_NAME_MAX)
++		return -E2BIG;
++
++	ab = audit_log_start(NULL, GFP_KERNEL, AUDIT_INTEGRITY_EVM_XATTR);
++	if (!ab)
++		return -ENOMEM;
++
++	xattr = kmalloc(sizeof(struct xattr_list), GFP_KERNEL);
++	if (!xattr) {
++		err = -ENOMEM;
++		goto out;
++	}
++
++	xattr->name = memdup_user_nul(buf, count);
++	if (IS_ERR(xattr->name)) {
++		err = PTR_ERR(xattr->name);
++		xattr->name = NULL;
++		goto out;
++	}
++
++	/* Remove any trailing newline */
++	len = strlen(xattr->name);
++	if (len && xattr->name[len-1] == '\n')
++		xattr->name[len-1] = '\0';
++
++	if (strcmp(xattr->name, ".") == 0) {
++		evm_xattrs_locked = 1;
++		newattrs.ia_mode = S_IFREG | 0440;
++		newattrs.ia_valid = ATTR_MODE;
++		inode = evm_xattrs->d_inode;
++		inode_lock(inode);
++		err = simple_setattr(evm_xattrs, &newattrs);
++		inode_unlock(inode);
++		audit_log_format(ab, "locked");
++		if (!err)
++			err = count;
++		goto out;
++	}
++
++	audit_log_format(ab, "xattr=");
++	audit_log_untrustedstring(ab, xattr->name);
++
++	if (strncmp(xattr->name, XATTR_SECURITY_PREFIX,
++		    XATTR_SECURITY_PREFIX_LEN) != 0) {
++		err = -EINVAL;
++		goto out;
++	}
++
++	/* Guard against races in evm_read_xattrs */
++	mutex_lock(&xattr_list_mutex);
++	list_for_each_entry(tmp, &evm_config_xattrnames, list) {
++		if (strcmp(xattr->name, tmp->name) == 0) {
++			err = -EEXIST;
++			mutex_unlock(&xattr_list_mutex);
++			goto out;
++		}
++	}
++	list_add_tail_rcu(&xattr->list, &evm_config_xattrnames);
++	mutex_unlock(&xattr_list_mutex);
++
++	audit_log_format(ab, " res=0");
++	audit_log_end(ab);
++	return count;
++out:
++	audit_log_format(ab, " res=%d", err);
++	audit_log_end(ab);
++	if (xattr) {
++		kfree(xattr->name);
++		kfree(xattr);
++	}
++	return err;
++}
++
++static const struct file_operations evm_xattr_ops = {
++	.read		= evm_read_xattrs,
++	.write		= evm_write_xattrs,
++};
++
++static int evm_init_xattrs(void)
++{
++	evm_xattrs = securityfs_create_file("evm_xattrs", 0660, evm_dir, NULL,
++					    &evm_xattr_ops);
++	if (!evm_xattrs || IS_ERR(evm_xattrs))
++		return -EFAULT;
++
++	return 0;
++}
++#else
++static int evm_init_xattrs(void)
++{
++	return 0;
++}
++#endif
++
+ int __init evm_init_secfs(void)
+ {
+ 	int error = 0;
+ 
+-	evm_init_tpm = securityfs_create_file("evm", S_IRUSR | S_IRGRP,
+-					      NULL, NULL, &evm_key_ops);
+-	if (!evm_init_tpm || IS_ERR(evm_init_tpm))
++	evm_dir = securityfs_create_dir("evm", integrity_dir);
++	if (!evm_dir || IS_ERR(evm_dir))
++		return -EFAULT;
++
++	evm_init_tpm = securityfs_create_file("evm", 0660,
++					      evm_dir, NULL, &evm_key_ops);
++	if (!evm_init_tpm || IS_ERR(evm_init_tpm)) {
++		error = -EFAULT;
++		goto out;
++	}
++
++	evm_symlink = securityfs_create_symlink("evm", NULL,
++						"integrity/evm/evm", NULL);
++	if (!evm_symlink || IS_ERR(evm_symlink)) {
++		error = -EFAULT;
++		goto out;
++	}
++
++	if (evm_init_xattrs() != 0) {
+ 		error = -EFAULT;
++		goto out;
++	}
++
++	return 0;
++out:
++	securityfs_remove(evm_symlink);
++	securityfs_remove(evm_init_tpm);
++	securityfs_remove(evm_dir);
+ 	return error;
+ }
+diff -Nurp 4.9.0/integrity/evm/Kconfig 4.19.98/integrity/evm/Kconfig
+--- 4.9.0/integrity/evm/Kconfig	2020-03-14 21:09:21.993540503 +0800
++++ 4.19.98/integrity/evm/Kconfig	2020-03-14 20:52:04.881839999 +0800
+@@ -4,6 +4,7 @@ config EVM
+ 	select ENCRYPTED_KEYS
+ 	select CRYPTO_HMAC
+ 	select CRYPTO_SHA1
++	select CRYPTO_HASH_INFO
+ 	default n
+ 	help
+ 	  EVM protects a file's security extended attributes against
+@@ -42,6 +43,17 @@ config EVM_EXTRA_SMACK_XATTRS
+ 	  additional info to the calculation, requires existing EVM
+ 	  labeled file systems to be relabeled.
+ 
++config EVM_ADD_XATTRS
++	bool "Add additional EVM extended attributes at runtime"
++	depends on EVM
++	default n
++	help
++	  Allow userland to provide additional xattrs for HMAC calculation.
++
++	  When this option is enabled, root can add additional xattrs to the
++	  list used by EVM by writing them into
++	  /sys/kernel/security/integrity/evm/evm_xattrs.
++
+ config EVM_LOAD_X509
+ 	bool "Load an X509 certificate onto the '.evm' trusted keyring"
+ 	depends on EVM && INTEGRITY_TRUSTED_KEYRING
+diff -Nurp 4.9.0/integrity/iint.c 4.19.98/integrity/iint.c
+--- 4.9.0/integrity/iint.c	2020-03-14 21:09:21.993540503 +0800
++++ 4.19.98/integrity/iint.c	2020-03-14 20:52:04.881839999 +0800
+@@ -21,12 +21,15 @@
+ #include <linux/rbtree.h>
+ #include <linux/file.h>
+ #include <linux/uaccess.h>
++#include <linux/security.h>
+ #include "integrity.h"
+ 
+ static struct rb_root integrity_iint_tree = RB_ROOT;
+ static DEFINE_RWLOCK(integrity_iint_lock);
+ static struct kmem_cache *iint_cache __read_mostly;
+ 
++struct dentry *integrity_dir;
++
+ /*
+  * __integrity_iint_find - return the iint associated with an inode
+  */
+@@ -74,10 +77,12 @@ static void iint_free(struct integrity_i
+ 	iint->ima_hash = NULL;
+ 	iint->version = 0;
+ 	iint->flags = 0UL;
++	iint->atomic_flags = 0UL;
+ 	iint->ima_file_status = INTEGRITY_UNKNOWN;
+ 	iint->ima_mmap_status = INTEGRITY_UNKNOWN;
+ 	iint->ima_bprm_status = INTEGRITY_UNKNOWN;
+ 	iint->ima_read_status = INTEGRITY_UNKNOWN;
++	iint->ima_creds_status = INTEGRITY_UNKNOWN;
+ 	iint->evm_status = INTEGRITY_UNKNOWN;
+ 	iint->measured_pcrs = 0;
+ 	kmem_cache_free(iint_cache, iint);
+@@ -153,14 +158,13 @@ static void init_once(void *foo)
+ 	struct integrity_iint_cache *iint = foo;
+ 
+ 	memset(iint, 0, sizeof(*iint));
+-	iint->version = 0;
+-	iint->flags = 0UL;
+ 	iint->ima_file_status = INTEGRITY_UNKNOWN;
+ 	iint->ima_mmap_status = INTEGRITY_UNKNOWN;
+ 	iint->ima_bprm_status = INTEGRITY_UNKNOWN;
+ 	iint->ima_read_status = INTEGRITY_UNKNOWN;
++	iint->ima_creds_status = INTEGRITY_UNKNOWN;
+ 	iint->evm_status = INTEGRITY_UNKNOWN;
+-	iint->measured_pcrs = 0;
++	mutex_init(&iint->mutex);
+ }
+ 
+ static int __init integrity_iintcache_init(void)
+@@ -182,7 +186,7 @@ security_initcall(integrity_iintcache_in
+  *
+  */
+ int integrity_kernel_read(struct file *file, loff_t offset,
+-			  char *addr, unsigned long count)
++			  void *addr, unsigned long count)
+ {
+ 	mm_segment_t old_fs;
+ 	char __user *buf = (char __user *)addr;
+@@ -200,55 +204,6 @@ int integrity_kernel_read(struct file *f
+ }
+ 
+ /*
+- * integrity_read_file - read entire file content into the buffer
+- *
+- * This is function opens a file, allocates the buffer of required
+- * size, read entire file content to the buffer and closes the file
+- *
+- * It is used only by init code.
+- *
+- */
+-int __init integrity_read_file(const char *path, char **data)
+-{
+-	struct file *file;
+-	loff_t size;
+-	char *buf;
+-	int rc = -EINVAL;
+-
+-	if (!path || !*path)
+-		return -EINVAL;
+-
+-	file = filp_open(path, O_RDONLY, 0);
+-	if (IS_ERR(file)) {
+-		rc = PTR_ERR(file);
+-		pr_err("Unable to open file: %s (%d)", path, rc);
+-		return rc;
+-	}
+-
+-	size = i_size_read(file_inode(file));
+-	if (size <= 0)
+-		goto out;
+-
+-	buf = kmalloc(size, GFP_KERNEL);
+-	if (!buf) {
+-		rc = -ENOMEM;
+-		goto out;
+-	}
+-
+-	rc = integrity_kernel_read(file, 0, buf, size);
+-	if (rc == size) {
+-		*data = buf;
+-	} else {
+-		kfree(buf);
+-		if (rc >= 0)
+-			rc = -EIO;
+-	}
+-out:
+-	fput(file);
+-	return rc;
+-}
+-
+-/*
+  * integrity_load_keys - load integrity keys hook
+  *
+  * Hooks is called from init/main.c:kernel_init_freeable()
+@@ -259,3 +214,21 @@ void __init integrity_load_keys(void)
+ 	ima_load_x509();
+ 	evm_load_x509();
+ }
++
++static int __init integrity_fs_init(void)
++{
++	integrity_dir = securityfs_create_dir("integrity", NULL);
++	if (IS_ERR(integrity_dir)) {
++		int ret = PTR_ERR(integrity_dir);
++
++		if (ret != -ENODEV)
++			pr_err("Unable to create integrity sysfs dir: %d\n",
++			       ret);
++		integrity_dir = NULL;
++		return ret;
++	}
++
++	return 0;
++}
++
++late_initcall(integrity_fs_init)
+diff -Nurp 4.9.0/integrity/ima/ima_api.c 4.19.98/integrity/ima/ima_api.c
+--- 4.9.0/integrity/ima/ima_api.c	2020-03-14 21:09:21.993540503 +0800
++++ 4.19.98/integrity/ima/ima_api.c	2020-03-14 20:52:04.881839999 +0800
+@@ -18,6 +18,7 @@
+ #include <linux/fs.h>
+ #include <linux/xattr.h>
+ #include <linux/evm.h>
++#include <linux/iversion.h>
+ 
+ #include "ima.h"
+ 
+@@ -157,27 +158,31 @@ err_out:
+ /**
+  * ima_get_action - appraise & measure decision based on policy.
+  * @inode: pointer to inode to measure
+- * @mask: contains the permission mask (MAY_READ, MAY_WRITE, MAY_EXECUTE)
++ * @cred: pointer to credentials structure to validate
++ * @secid: secid of the task being validated
++ * @mask: contains the permission mask (MAY_READ, MAY_WRITE, MAY_EXEC,
++ *        MAY_APPEND)
+  * @func: caller identifier
+  * @pcr: pointer filled in if matched measure policy sets pcr=
+  *
+  * The policy is defined in terms of keypairs:
+  *		subj=, obj=, type=, func=, mask=, fsmagic=
+  *	subj,obj, and type: are LSM specific.
+- *	func: FILE_CHECK | BPRM_CHECK | MMAP_CHECK | MODULE_CHECK
++ *	func: FILE_CHECK | BPRM_CHECK | CREDS_CHECK | MMAP_CHECK | MODULE_CHECK
+  *	mask: contains the permission mask
+  *	fsmagic: hex value
+  *
+  * Returns IMA_MEASURE, IMA_APPRAISE mask.
+  *
+  */
+-int ima_get_action(struct inode *inode, int mask, enum ima_hooks func, int *pcr)
++int ima_get_action(struct inode *inode, const struct cred *cred, u32 secid,
++		   int mask, enum ima_hooks func, int *pcr)
+ {
+-	int flags = IMA_MEASURE | IMA_AUDIT | IMA_APPRAISE;
++	int flags = IMA_MEASURE | IMA_AUDIT | IMA_APPRAISE | IMA_HASH;
+ 
+ 	flags &= ima_policy_flag;
+ 
+-	return ima_match_policy(inode, func, mask, flags, pcr);
++	return ima_match_policy(inode, cred, secid, func, mask, flags, pcr);
+ }
+ 
+ /*
+@@ -198,42 +203,59 @@ int ima_collect_measurement(struct integ
+ 	struct inode *inode = file_inode(file);
+ 	const char *filename = file->f_path.dentry->d_name.name;
+ 	int result = 0;
++	int length;
++	void *tmpbuf;
++	u64 i_version;
+ 	struct {
+ 		struct ima_digest_data hdr;
+ 		char digest[IMA_MAX_DIGEST_SIZE];
+ 	} hash;
+ 
+-	if (!(iint->flags & IMA_COLLECTED)) {
+-		u64 i_version = file_inode(file)->i_version;
++	if (iint->flags & IMA_COLLECTED)
++		goto out;
+ 
+-		if (file->f_flags & O_DIRECT) {
+-			audit_cause = "failed(directio)";
+-			result = -EACCES;
+-			goto out;
+-		}
+-
+-		hash.hdr.algo = algo;
+-
+-		result = (!buf) ?  ima_calc_file_hash(file, &hash.hdr) :
+-			ima_calc_buffer_hash(buf, size, &hash.hdr);
+-		if (!result) {
+-			int length = sizeof(hash.hdr) + hash.hdr.length;
+-			void *tmpbuf = krealloc(iint->ima_hash, length,
+-						GFP_NOFS);
+-			if (tmpbuf) {
+-				iint->ima_hash = tmpbuf;
+-				memcpy(iint->ima_hash, &hash, length);
+-				iint->version = i_version;
+-				iint->flags |= IMA_COLLECTED;
+-			} else
+-				result = -ENOMEM;
+-		}
++	/*
++	 * Dectecting file change is based on i_version. On filesystems
++	 * which do not support i_version, support is limited to an initial
++	 * measurement/appraisal/audit.
++	 */
++	i_version = inode_query_iversion(inode);
++	hash.hdr.algo = algo;
++
++	/* Initialize hash digest to 0's in case of failure */
++	memset(&hash.digest, 0, sizeof(hash.digest));
++
++	if (buf)
++		result = ima_calc_buffer_hash(buf, size, &hash.hdr);
++	else
++		result = ima_calc_file_hash(file, &hash.hdr);
++
++	if (result && result != -EBADF && result != -EINVAL)
++		goto out;
++
++	length = sizeof(hash.hdr) + hash.hdr.length;
++	tmpbuf = krealloc(iint->ima_hash, length, GFP_NOFS);
++	if (!tmpbuf) {
++		result = -ENOMEM;
++		goto out;
+ 	}
++
++	iint->ima_hash = tmpbuf;
++	memcpy(iint->ima_hash, &hash, length);
++	iint->version = i_version;
++
++	/* Possibly temporary failure due to type of read (eg. O_DIRECT) */
++	if (!result)
++		iint->flags |= IMA_COLLECTED;
+ out:
+-	if (result)
++	if (result) {
++		if (file->f_flags & O_DIRECT)
++			audit_cause = "failed(directio)";
++
+ 		integrity_audit_msg(AUDIT_INTEGRITY_DATA, inode,
+ 				    filename, "collect_data", audit_cause,
+ 				    result, 0);
++	}
+ 	return result;
+ }
+ 
+@@ -277,7 +299,7 @@ void ima_store_measurement(struct integr
+ 	}
+ 
+ 	result = ima_store_template(entry, violation, inode, filename, pcr);
+-	if (!result || result == -EEXIST) {
++	if ((!result || result == -EEXIST) && !(file->f_flags & O_DIRECT)) {
+ 		iint->flags |= IMA_MEASURED;
+ 		iint->measured_pcrs |= (0x1 << pcr);
+ 	}
+@@ -289,36 +311,50 @@ void ima_audit_measurement(struct integr
+ 			   const unsigned char *filename)
+ {
+ 	struct audit_buffer *ab;
+-	char hash[(iint->ima_hash->length * 2) + 1];
++	char *hash;
+ 	const char *algo_name = hash_algo_name[iint->ima_hash->algo];
+-	char algo_hash[sizeof(hash) + strlen(algo_name) + 2];
+ 	int i;
+ 
+ 	if (iint->flags & IMA_AUDITED)
+ 		return;
+ 
++	hash = kzalloc((iint->ima_hash->length * 2) + 1, GFP_KERNEL);
++	if (!hash)
++		return;
++
+ 	for (i = 0; i < iint->ima_hash->length; i++)
+ 		hex_byte_pack(hash + (i * 2), iint->ima_hash->digest[i]);
+ 	hash[i * 2] = '\0';
+ 
+-	ab = audit_log_start(current->audit_context, GFP_KERNEL,
++	ab = audit_log_start(audit_context(), GFP_KERNEL,
+ 			     AUDIT_INTEGRITY_RULE);
+ 	if (!ab)
+-		return;
++		goto out;
+ 
+ 	audit_log_format(ab, "file=");
+ 	audit_log_untrustedstring(ab, filename);
+-	audit_log_format(ab, " hash=");
+-	snprintf(algo_hash, sizeof(algo_hash), "%s:%s", algo_name, hash);
+-	audit_log_untrustedstring(ab, algo_hash);
++	audit_log_format(ab, " hash=\"%s:%s\"", algo_name, hash);
+ 
+ 	audit_log_task_info(ab, current);
+ 	audit_log_end(ab);
+ 
+ 	iint->flags |= IMA_AUDITED;
++out:
++	kfree(hash);
++	return;
+ }
+ 
+-const char *ima_d_path(const struct path *path, char **pathbuf)
++/*
++ * ima_d_path - return a pointer to the full pathname
++ *
++ * Attempt to return a pointer to the full pathname for use in the
++ * IMA measurement list, IMA audit records, and auditing logs.
++ *
++ * On failure, return a pointer to a copy of the filename, not dname.
++ * Returning a pointer to dname, could result in using the pointer
++ * after the memory has been freed.
++ */
++const char *ima_d_path(const struct path *path, char **pathbuf, char *namebuf)
+ {
+ 	char *pathname = NULL;
+ 
+@@ -331,5 +367,11 @@ const char *ima_d_path(const struct path
+ 			pathname = NULL;
+ 		}
+ 	}
+-	return pathname ?: (const char *)path->dentry->d_name.name;
++
++	if (!pathname) {
++		strlcpy(namebuf, path->dentry->d_name.name, NAME_MAX);
++		pathname = namebuf;
++	}
++
++	return pathname;
+ }
+diff -Nurp 4.9.0/integrity/ima/ima_appraise.c 4.19.98/integrity/ima/ima_appraise.c
+--- 4.9.0/integrity/ima/ima_appraise.c	2020-03-14 21:09:21.993540503 +0800
++++ 4.19.98/integrity/ima/ima_appraise.c	2020-03-14 20:52:04.881839999 +0800
+@@ -20,28 +20,44 @@
+ 
+ static int __init default_appraise_setup(char *str)
+ {
++#ifdef CONFIG_IMA_APPRAISE_BOOTPARAM
+ 	if (strncmp(str, "off", 3) == 0)
+ 		ima_appraise = 0;
+ 	else if (strncmp(str, "log", 3) == 0)
+ 		ima_appraise = IMA_APPRAISE_LOG;
+ 	else if (strncmp(str, "fix", 3) == 0)
+ 		ima_appraise = IMA_APPRAISE_FIX;
++#endif
+ 	return 1;
+ }
+ 
+ __setup("ima_appraise=", default_appraise_setup);
+ 
+ /*
++ * is_ima_appraise_enabled - return appraise status
++ *
++ * Only return enabled, if not in ima_appraise="fix" or "log" modes.
++ */
++bool is_ima_appraise_enabled(void)
++{
++	return ima_appraise & IMA_APPRAISE_ENFORCE;
++}
++
++/*
+  * ima_must_appraise - set appraise flag
+  *
+- * Return 1 to appraise
++ * Return 1 to appraise or hash
+  */
+ int ima_must_appraise(struct inode *inode, int mask, enum ima_hooks func)
+ {
++	u32 secid;
++
+ 	if (!ima_appraise)
+ 		return 0;
+ 
+-	return ima_match_policy(inode, func, mask, IMA_APPRAISE, NULL);
++	security_task_getsecid(current, &secid);
++	return ima_match_policy(inode, current_cred(), secid, func, mask,
++				IMA_APPRAISE | IMA_HASH, NULL);
+ }
+ 
+ static int ima_fix_xattr(struct dentry *dentry,
+@@ -74,6 +90,8 @@ enum integrity_status ima_get_cache_stat
+ 		return iint->ima_mmap_status;
+ 	case BPRM_CHECK:
+ 		return iint->ima_bprm_status;
++	case CREDS_CHECK:
++		return iint->ima_creds_status;
+ 	case FILE_CHECK:
+ 	case POST_SETATTR:
+ 		return iint->ima_file_status;
+@@ -94,6 +112,8 @@ static void ima_set_cache_status(struct
+ 	case BPRM_CHECK:
+ 		iint->ima_bprm_status = status;
+ 		break;
++	case CREDS_CHECK:
++		iint->ima_creds_status = status;
+ 	case FILE_CHECK:
+ 	case POST_SETATTR:
+ 		iint->ima_file_status = status;
+@@ -115,6 +135,9 @@ static void ima_cache_flags(struct integ
+ 	case BPRM_CHECK:
+ 		iint->flags |= (IMA_BPRM_APPRAISED | IMA_APPRAISED);
+ 		break;
++	case CREDS_CHECK:
++		iint->flags |= (IMA_CREDS_APPRAISED | IMA_APPRAISED);
++		break;
+ 	case FILE_CHECK:
+ 	case POST_SETATTR:
+ 		iint->flags |= (IMA_FILE_APPRAISED | IMA_APPRAISED);
+@@ -130,6 +153,7 @@ enum hash_algo ima_get_hash_algo(struct
+ 				 int xattr_len)
+ {
+ 	struct signature_v2_hdr *sig;
++	enum hash_algo ret;
+ 
+ 	if (!xattr_value || xattr_len < 2)
+ 		/* return default hash algo */
+@@ -143,7 +167,9 @@ enum hash_algo ima_get_hash_algo(struct
+ 		return sig->hash_algo;
+ 		break;
+ 	case IMA_XATTR_DIGEST_NG:
+-		return xattr_value->digest[0];
++		ret = xattr_value->digest[0];
++		if (ret < HASH_ALGO__LAST)
++			return ret;
+ 		break;
+ 	case IMA_XATTR_DIGEST:
+ 		/* this is for backward compatibility */
+@@ -186,10 +212,10 @@ int ima_appraise_measurement(enum ima_ho
+ 			     struct integrity_iint_cache *iint,
+ 			     struct file *file, const unsigned char *filename,
+ 			     struct evm_ima_xattr_data *xattr_value,
+-			     int xattr_len, int opened)
++			     int xattr_len)
+ {
+ 	static const char op[] = "appraise_data";
+-	char *cause = "unknown";
++	const char *cause = "unknown";
+ 	struct dentry *dentry = file_dentry(file);
+ 	struct inode *inode = d_backing_inode(dentry);
+ 	enum integrity_status status = INTEGRITY_UNKNOWN;
+@@ -202,34 +228,47 @@ int ima_appraise_measurement(enum ima_ho
+ 		if (rc && rc != -ENODATA)
+ 			goto out;
+ 
+-		cause = "missing-hash";
++		cause = iint->flags & IMA_DIGSIG_REQUIRED ?
++				"IMA-signature-required" : "missing-hash";
+ 		status = INTEGRITY_NOLABEL;
+-		if (opened & FILE_CREATED) {
++		if (file->f_mode & FMODE_CREATED)
+ 			iint->flags |= IMA_NEW_FILE;
++		if ((iint->flags & IMA_NEW_FILE) &&
++		    (!(iint->flags & IMA_DIGSIG_REQUIRED) ||
++		     (inode->i_size == 0)))
+ 			status = INTEGRITY_PASS;
+-		}
+ 		goto out;
+ 	}
+ 
+ 	status = evm_verifyxattr(dentry, XATTR_NAME_IMA, xattr_value, rc, iint);
+-	if ((status != INTEGRITY_PASS) && (status != INTEGRITY_UNKNOWN)) {
+-		if ((status == INTEGRITY_NOLABEL)
+-		    || (status == INTEGRITY_NOXATTRS))
+-			cause = "missing-HMAC";
+-		else if (status == INTEGRITY_FAIL)
+-			cause = "invalid-HMAC";
++	switch (status) {
++	case INTEGRITY_PASS:
++	case INTEGRITY_PASS_IMMUTABLE:
++	case INTEGRITY_UNKNOWN:
++		break;
++	case INTEGRITY_NOXATTRS:	/* No EVM protected xattrs. */
++	case INTEGRITY_NOLABEL:		/* No security.evm xattr. */
++		cause = "missing-HMAC";
++		goto out;
++	case INTEGRITY_FAIL:		/* Invalid HMAC/signature. */
++		cause = "invalid-HMAC";
+ 		goto out;
++	default:
++		WARN_ONCE(true, "Unexpected integrity status %d\n", status);
+ 	}
++
+ 	switch (xattr_value->type) {
+ 	case IMA_XATTR_DIGEST_NG:
+ 		/* first byte contains algorithm id */
+ 		hash_start = 1;
++		/* fall through */
+ 	case IMA_XATTR_DIGEST:
+ 		if (iint->flags & IMA_DIGSIG_REQUIRED) {
+ 			cause = "IMA-signature-required";
+ 			status = INTEGRITY_FAIL;
+ 			break;
+ 		}
++		clear_bit(IMA_DIGSIG, &iint->atomic_flags);
+ 		if (xattr_len - sizeof(xattr_value->type) - hash_start >=
+ 				iint->ima_hash->length)
+ 			/* xattr length may be longer. md5 hash in previous
+@@ -248,7 +287,7 @@ int ima_appraise_measurement(enum ima_ho
+ 		status = INTEGRITY_PASS;
+ 		break;
+ 	case EVM_IMA_XATTR_DIGSIG:
+-		iint->flags |= IMA_DIGSIG;
++		set_bit(IMA_DIGSIG, &iint->atomic_flags);
+ 		rc = integrity_digsig_verify(INTEGRITY_KEYRING_IMA,
+ 					     (const char *)xattr_value, rc,
+ 					     iint->ima_hash->digest,
+@@ -269,23 +308,40 @@ int ima_appraise_measurement(enum ima_ho
+ 	}
+ 
+ out:
+-	if (status != INTEGRITY_PASS) {
++	/*
++	 * File signatures on some filesystems can not be properly verified.
++	 * When such filesystems are mounted by an untrusted mounter or on a
++	 * system not willing to accept such a risk, fail the file signature
++	 * verification.
++	 */
++	if ((inode->i_sb->s_iflags & SB_I_IMA_UNVERIFIABLE_SIGNATURE) &&
++	    ((inode->i_sb->s_iflags & SB_I_UNTRUSTED_MOUNTER) ||
++	     (iint->flags & IMA_FAIL_UNVERIFIABLE_SIGS))) {
++		status = INTEGRITY_FAIL;
++		cause = "unverifiable-signature";
++		integrity_audit_msg(AUDIT_INTEGRITY_DATA, inode, filename,
++				    op, cause, rc, 0);
++	} else if (status != INTEGRITY_PASS) {
++		/* Fix mode, but don't replace file signatures. */
+ 		if ((ima_appraise & IMA_APPRAISE_FIX) &&
+ 		    (!xattr_value ||
+ 		     xattr_value->type != EVM_IMA_XATTR_DIGSIG)) {
+ 			if (!ima_fix_xattr(dentry, iint))
+ 				status = INTEGRITY_PASS;
+-		} else if ((inode->i_size == 0) &&
+-			   (iint->flags & IMA_NEW_FILE) &&
+-			   (xattr_value &&
+-			    xattr_value->type == EVM_IMA_XATTR_DIGSIG)) {
++		}
++
++		/* Permit new files with file signatures, but without data. */
++		if (inode->i_size == 0 && iint->flags & IMA_NEW_FILE &&
++		    xattr_value && xattr_value->type == EVM_IMA_XATTR_DIGSIG) {
+ 			status = INTEGRITY_PASS;
+ 		}
++
+ 		integrity_audit_msg(AUDIT_INTEGRITY_DATA, inode, filename,
+ 				    op, cause, rc, 0);
+ 	} else {
+ 		ima_cache_flags(iint, func);
+ 	}
++
+ 	ima_set_cache_status(iint, func, status);
+ 	return status;
+ }
+@@ -299,14 +355,20 @@ void ima_update_xattr(struct integrity_i
+ 	int rc = 0;
+ 
+ 	/* do not collect and update hash for digital signatures */
+-	if (iint->flags & IMA_DIGSIG)
++	if (test_bit(IMA_DIGSIG, &iint->atomic_flags))
++		return;
++
++	if ((iint->ima_file_status != INTEGRITY_PASS) &&
++	    !(iint->flags & IMA_HASH))
+ 		return;
+ 
+ 	rc = ima_collect_measurement(iint, file, NULL, 0, ima_hash_algo);
+ 	if (rc < 0)
+ 		return;
+ 
++	inode_lock(file_inode(file));
+ 	ima_fix_xattr(dentry, iint);
++	inode_unlock(file_inode(file));
+ }
+ 
+ /**
+@@ -322,23 +384,21 @@ void ima_inode_post_setattr(struct dentr
+ {
+ 	struct inode *inode = d_backing_inode(dentry);
+ 	struct integrity_iint_cache *iint;
+-	int must_appraise;
++	int action;
+ 
+ 	if (!(ima_policy_flag & IMA_APPRAISE) || !S_ISREG(inode->i_mode)
+ 	    || !(inode->i_opflags & IOP_XATTR))
+ 		return;
+ 
+-	must_appraise = ima_must_appraise(inode, MAY_ACCESS, POST_SETATTR);
++	action = ima_must_appraise(inode, MAY_ACCESS, POST_SETATTR);
++	if (!action)
++		__vfs_removexattr(dentry, XATTR_NAME_IMA);
+ 	iint = integrity_iint_find(inode);
+ 	if (iint) {
+-		iint->flags &= ~(IMA_APPRAISE | IMA_APPRAISED |
+-				 IMA_APPRAISE_SUBMASK | IMA_APPRAISED_SUBMASK |
+-				 IMA_ACTION_RULE_FLAGS);
+-		if (must_appraise)
+-			iint->flags |= IMA_APPRAISE;
++		set_bit(IMA_CHANGE_ATTR, &iint->atomic_flags);
++		if (!action)
++			clear_bit(IMA_UPDATE_XATTR, &iint->atomic_flags);
+ 	}
+-	if (!must_appraise)
+-		__vfs_removexattr(dentry, XATTR_NAME_IMA);
+ }
+ 
+ /*
+@@ -367,12 +427,12 @@ static void ima_reset_appraise_flags(str
+ 	iint = integrity_iint_find(inode);
+ 	if (!iint)
+ 		return;
+-
+-	iint->flags &= ~IMA_DONE_MASK;
+ 	iint->measured_pcrs = 0;
++	set_bit(IMA_CHANGE_XATTR, &iint->atomic_flags);
+ 	if (digsig)
+-		iint->flags |= IMA_DIGSIG;
+-	return;
++		set_bit(IMA_DIGSIG, &iint->atomic_flags);
++	else
++		clear_bit(IMA_DIGSIG, &iint->atomic_flags);
+ }
+ 
+ int ima_inode_setxattr(struct dentry *dentry, const char *xattr_name,
+@@ -384,14 +444,10 @@ int ima_inode_setxattr(struct dentry *de
+ 	result = ima_protect_xattr(dentry, xattr_name, xattr_value,
+ 				   xattr_value_len);
+ 	if (result == 1) {
+-		bool digsig;
+-
+ 		if (!xattr_value_len || (xvalue->type >= IMA_XATTR_LAST))
+ 			return -EINVAL;
+-		digsig = (xvalue->type == EVM_IMA_XATTR_DIGSIG);
+-		if (!digsig && (ima_appraise & IMA_APPRAISE_ENFORCE))
+-			return -EPERM;
+-		ima_reset_appraise_flags(d_backing_inode(dentry), digsig);
++		ima_reset_appraise_flags(d_backing_inode(dentry),
++			xvalue->type == EVM_IMA_XATTR_DIGSIG);
+ 		result = 0;
+ 	}
+ 	return result;
+diff -Nurp 4.9.0/integrity/ima/ima_crypto.c 4.19.98/integrity/ima/ima_crypto.c
+--- 4.9.0/integrity/ima/ima_crypto.c	2020-03-14 21:09:21.993540503 +0800
++++ 4.19.98/integrity/ima/ima_crypto.c	2020-03-14 20:52:04.881839999 +0800
+@@ -27,11 +27,6 @@
+ 
+ #include "ima.h"
+ 
+-struct ahash_completion {
+-	struct completion completion;
+-	int err;
+-};
+-
+ /* minimum file size for ahash use */
+ static unsigned long ima_ahash_minsize;
+ module_param_named(ahash_minsize, ima_ahash_minsize, ulong, 0644);
+@@ -78,6 +73,8 @@ int __init ima_init_crypto(void)
+ 		       hash_algo_name[ima_hash_algo], rc);
+ 		return rc;
+ 	}
++	pr_info("Allocated hash algorithm: %s\n",
++		hash_algo_name[ima_hash_algo]);
+ 	return 0;
+ }
+ 
+@@ -196,30 +193,13 @@ static void ima_free_atfm(struct crypto_
+ 		crypto_free_ahash(tfm);
+ }
+ 
+-static void ahash_complete(struct crypto_async_request *req, int err)
++static inline int ahash_wait(int err, struct crypto_wait *wait)
+ {
+-	struct ahash_completion *res = req->data;
+ 
+-	if (err == -EINPROGRESS)
+-		return;
+-	res->err = err;
+-	complete(&res->completion);
+-}
++	err = crypto_wait_req(err, wait);
+ 
+-static int ahash_wait(int err, struct ahash_completion *res)
+-{
+-	switch (err) {
+-	case 0:
+-		break;
+-	case -EINPROGRESS:
+-	case -EBUSY:
+-		wait_for_completion(&res->completion);
+-		reinit_completion(&res->completion);
+-		err = res->err;
+-		/* fall through */
+-	default:
++	if (err)
+ 		pr_crit_ratelimited("ahash calculation failed: err: %d\n", err);
+-	}
+ 
+ 	return err;
+ }
+@@ -230,10 +210,10 @@ static int ima_calc_file_hash_atfm(struc
+ {
+ 	loff_t i_size, offset;
+ 	char *rbuf[2] = { NULL, };
+-	int rc, read = 0, rbuf_len, active = 0, ahash_rc = 0;
++	int rc, rbuf_len, active = 0, ahash_rc = 0;
+ 	struct ahash_request *req;
+ 	struct scatterlist sg[1];
+-	struct ahash_completion res;
++	struct crypto_wait wait;
+ 	size_t rbuf_size[2];
+ 
+ 	hash->length = crypto_ahash_digestsize(tfm);
+@@ -242,12 +222,12 @@ static int ima_calc_file_hash_atfm(struc
+ 	if (!req)
+ 		return -ENOMEM;
+ 
+-	init_completion(&res.completion);
++	crypto_init_wait(&wait);
+ 	ahash_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG |
+ 				   CRYPTO_TFM_REQ_MAY_SLEEP,
+-				   ahash_complete, &res);
++				   crypto_req_done, &wait);
+ 
+-	rc = ahash_wait(crypto_ahash_init(req), &res);
++	rc = ahash_wait(crypto_ahash_init(req), &wait);
+ 	if (rc)
+ 		goto out1;
+ 
+@@ -277,18 +257,13 @@ static int ima_calc_file_hash_atfm(struc
+ 					  &rbuf_size[1], 0);
+ 	}
+ 
+-	if (!(file->f_mode & FMODE_READ)) {
+-		file->f_mode |= FMODE_READ;
+-		read = 1;
+-	}
+-
+ 	for (offset = 0; offset < i_size; offset += rbuf_len) {
+ 		if (!rbuf[1] && offset) {
+ 			/* Not using two buffers, and it is not the first
+ 			 * read/request, wait for the completion of the
+ 			 * previous ahash_update() request.
+ 			 */
+-			rc = ahash_wait(ahash_rc, &res);
++			rc = ahash_wait(ahash_rc, &wait);
+ 			if (rc)
+ 				goto out3;
+ 		}
+@@ -296,15 +271,23 @@ static int ima_calc_file_hash_atfm(struc
+ 		rbuf_len = min_t(loff_t, i_size - offset, rbuf_size[active]);
+ 		rc = integrity_kernel_read(file, offset, rbuf[active],
+ 					   rbuf_len);
+-		if (rc != rbuf_len)
++		if (rc != rbuf_len) {
++			if (rc >= 0)
++				rc = -EINVAL;
++			/*
++			 * Forward current rc, do not overwrite with return value
++			 * from ahash_wait()
++			 */
++			ahash_wait(ahash_rc, &wait);
+ 			goto out3;
++		}
+ 
+ 		if (rbuf[1] && offset) {
+ 			/* Using two buffers, and it is not the first
+ 			 * read/request, wait for the completion of the
+ 			 * previous ahash_update() request.
+ 			 */
+-			rc = ahash_wait(ahash_rc, &res);
++			rc = ahash_wait(ahash_rc, &wait);
+ 			if (rc)
+ 				goto out3;
+ 		}
+@@ -318,16 +301,14 @@ static int ima_calc_file_hash_atfm(struc
+ 			active = !active; /* swap buffers, if we use two */
+ 	}
+ 	/* wait for the last update request to complete */
+-	rc = ahash_wait(ahash_rc, &res);
++	rc = ahash_wait(ahash_rc, &wait);
+ out3:
+-	if (read)
+-		file->f_mode &= ~FMODE_READ;
+ 	ima_free_pages(rbuf[0], rbuf_size[0]);
+ 	ima_free_pages(rbuf[1], rbuf_size[1]);
+ out2:
+ 	if (!rc) {
+ 		ahash_request_set_crypt(req, NULL, hash->digest, 0);
+-		rc = ahash_wait(crypto_ahash_final(req), &res);
++		rc = ahash_wait(crypto_ahash_final(req), &wait);
+ 	}
+ out1:
+ 	ahash_request_free(req);
+@@ -356,7 +337,7 @@ static int ima_calc_file_hash_tfm(struct
+ {
+ 	loff_t i_size, offset = 0;
+ 	char *rbuf;
+-	int rc, read = 0;
++	int rc;
+ 	SHASH_DESC_ON_STACK(shash, tfm);
+ 
+ 	shash->tfm = tfm;
+@@ -377,11 +358,6 @@ static int ima_calc_file_hash_tfm(struct
+ 	if (!rbuf)
+ 		return -ENOMEM;
+ 
+-	if (!(file->f_mode & FMODE_READ)) {
+-		file->f_mode |= FMODE_READ;
+-		read = 1;
+-	}
+-
+ 	while (offset < i_size) {
+ 		int rbuf_len;
+ 
+@@ -398,8 +374,6 @@ static int ima_calc_file_hash_tfm(struct
+ 		if (rc)
+ 			break;
+ 	}
+-	if (read)
+-		file->f_mode &= ~FMODE_READ;
+ 	kfree(rbuf);
+ out:
+ 	if (!rc)
+@@ -440,16 +414,54 @@ int ima_calc_file_hash(struct file *file
+ {
+ 	loff_t i_size;
+ 	int rc;
++	struct file *f = file;
++	bool new_file_instance = false, modified_flags = false;
+ 
+-	i_size = i_size_read(file_inode(file));
++	/*
++	 * For consistency, fail file's opened with the O_DIRECT flag on
++	 * filesystems mounted with/without DAX option.
++	 */
++	if (file->f_flags & O_DIRECT) {
++		hash->length = hash_digest_size[ima_hash_algo];
++		hash->algo = ima_hash_algo;
++		return -EINVAL;
++	}
++
++	/* Open a new file instance in O_RDONLY if we cannot read */
++	if (!(file->f_mode & FMODE_READ)) {
++		int flags = file->f_flags & ~(O_WRONLY | O_APPEND |
++				O_TRUNC | O_CREAT | O_NOCTTY | O_EXCL);
++		flags |= O_RDONLY;
++		f = dentry_open(&file->f_path, flags, file->f_cred);
++		if (IS_ERR(f)) {
++			/*
++			 * Cannot open the file again, lets modify f_flags
++			 * of original and continue
++			 */
++			pr_info_ratelimited("Unable to reopen file for reading.\n");
++			f = file;
++			f->f_flags |= FMODE_READ;
++			modified_flags = true;
++		} else {
++			new_file_instance = true;
++		}
++	}
++
++	i_size = i_size_read(file_inode(f));
+ 
+ 	if (ima_ahash_minsize && i_size >= ima_ahash_minsize) {
+-		rc = ima_calc_file_ahash(file, hash);
++		rc = ima_calc_file_ahash(f, hash);
+ 		if (!rc)
+-			return 0;
++			goto out;
+ 	}
+ 
+-	return ima_calc_file_shash(file, hash);
++	rc = ima_calc_file_shash(f, hash);
++out:
++	if (new_file_instance)
++		fput(f);
++	else if (modified_flags)
++		f->f_flags &= ~FMODE_READ;
++	return rc;
+ }
+ 
+ /*
+@@ -477,11 +489,13 @@ static int ima_calc_field_array_hash_tfm
+ 		u8 buffer[IMA_EVENT_NAME_LEN_MAX + 1] = { 0 };
+ 		u8 *data_to_hash = field_data[i].data;
+ 		u32 datalen = field_data[i].len;
++		u32 datalen_to_hash =
++		    !ima_canonical_fmt ? datalen : cpu_to_le32(datalen);
+ 
+ 		if (strcmp(td->name, IMA_TEMPLATE_IMA_NAME) != 0) {
+ 			rc = crypto_shash_update(shash,
+-						(const u8 *) &field_data[i].len,
+-						sizeof(field_data[i].len));
++						(const u8 *) &datalen_to_hash,
++						sizeof(datalen_to_hash));
+ 			if (rc)
+ 				break;
+ 		} else if (strcmp(td->fields[i]->field_id, "n") == 0) {
+@@ -525,7 +539,7 @@ static int calc_buffer_ahash_atfm(const
+ {
+ 	struct ahash_request *req;
+ 	struct scatterlist sg;
+-	struct ahash_completion res;
++	struct crypto_wait wait;
+ 	int rc, ahash_rc = 0;
+ 
+ 	hash->length = crypto_ahash_digestsize(tfm);
+@@ -534,12 +548,12 @@ static int calc_buffer_ahash_atfm(const
+ 	if (!req)
+ 		return -ENOMEM;
+ 
+-	init_completion(&res.completion);
++	crypto_init_wait(&wait);
+ 	ahash_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG |
+ 				   CRYPTO_TFM_REQ_MAY_SLEEP,
+-				   ahash_complete, &res);
++				   crypto_req_done, &wait);
+ 
+-	rc = ahash_wait(crypto_ahash_init(req), &res);
++	rc = ahash_wait(crypto_ahash_init(req), &wait);
+ 	if (rc)
+ 		goto out;
+ 
+@@ -549,10 +563,10 @@ static int calc_buffer_ahash_atfm(const
+ 	ahash_rc = crypto_ahash_update(req);
+ 
+ 	/* wait for the update request to complete */
+-	rc = ahash_wait(ahash_rc, &res);
++	rc = ahash_wait(ahash_rc, &wait);
+ 	if (!rc) {
+ 		ahash_request_set_crypt(req, NULL, hash->digest, 0);
+-		rc = ahash_wait(crypto_ahash_final(req), &res);
++		rc = ahash_wait(crypto_ahash_final(req), &wait);
+ 	}
+ out:
+ 	ahash_request_free(req);
+@@ -639,10 +653,10 @@ int ima_calc_buffer_hash(const void *buf
+ 
+ static void __init ima_pcrread(int idx, u8 *pcr)
+ {
+-	if (!ima_used_chip)
++	if (!ima_tpm_chip)
+ 		return;
+ 
+-	if (tpm_pcr_read(TPM_ANY_NUM, idx, pcr) != 0)
++	if (tpm_pcr_read(ima_tpm_chip, idx, pcr) != 0)
+ 		pr_err("Error Communicating to TPM chip\n");
+ }
+ 
+diff -Nurp 4.9.0/integrity/ima/ima_fs.c 4.19.98/integrity/ima/ima_fs.c
+--- 4.9.0/integrity/ima/ima_fs.c	2020-03-14 21:09:21.993540503 +0800
++++ 4.19.98/integrity/ima/ima_fs.c	2020-03-14 20:52:04.881839999 +0800
+@@ -15,6 +15,9 @@
+  *	implemenents security file system for reporting
+  *	current measurement list and IMA statistics
+  */
++
++#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
++
+ #include <linux/fcntl.h>
+ #include <linux/slab.h>
+ #include <linux/module.h>
+@@ -28,15 +31,25 @@
+ 
+ static DEFINE_MUTEX(ima_write_mutex);
+ 
++bool ima_canonical_fmt;
++static int __init default_canonical_fmt_setup(char *str)
++{
++#ifdef __BIG_ENDIAN
++	ima_canonical_fmt = true;
++#endif
++	return 1;
++}
++__setup("ima_canonical_fmt", default_canonical_fmt_setup);
++
+ static int valid_policy = 1;
+-#define TMPBUFLEN 12
++
+ static ssize_t ima_show_htable_value(char __user *buf, size_t count,
+ 				     loff_t *ppos, atomic_long_t *val)
+ {
+-	char tmpbuf[TMPBUFLEN];
++	char tmpbuf[32];	/* greater than largest 'long' string value */
+ 	ssize_t len;
+ 
+-	len = scnprintf(tmpbuf, TMPBUFLEN, "%li\n", atomic_long_read(val));
++	len = scnprintf(tmpbuf, sizeof(tmpbuf), "%li\n", atomic_long_read(val));
+ 	return simple_read_from_buffer(buf, count, ppos, tmpbuf, len);
+ }
+ 
+@@ -116,13 +129,13 @@ void ima_putc(struct seq_file *m, void *
+  *       [eventdata length]
+  *       eventdata[n]=template specific data
+  */
+-static int ima_measurements_show(struct seq_file *m, void *v)
++int ima_measurements_show(struct seq_file *m, void *v)
+ {
+ 	/* the list never shrinks, so we don't need a lock here */
+ 	struct ima_queue_entry *qe = v;
+ 	struct ima_template_entry *e;
+ 	char *template_name;
+-	int namelen;
++	u32 pcr, namelen, template_data_len; /* temporary fields */
+ 	bool is_ima_template = false;
+ 	int i;
+ 
+@@ -139,25 +152,29 @@ static int ima_measurements_show(struct
+ 	 * PCR used defaults to the same (config option) in
+ 	 * little-endian format, unless set in policy
+ 	 */
+-	ima_putc(m, &e->pcr, sizeof(e->pcr));
++	pcr = !ima_canonical_fmt ? e->pcr : cpu_to_le32(e->pcr);
++	ima_putc(m, &pcr, sizeof(e->pcr));
+ 
+ 	/* 2nd: template digest */
+ 	ima_putc(m, e->digest, TPM_DIGEST_SIZE);
+ 
+ 	/* 3rd: template name size */
+-	namelen = strlen(template_name);
++	namelen = !ima_canonical_fmt ? strlen(template_name) :
++		cpu_to_le32(strlen(template_name));
+ 	ima_putc(m, &namelen, sizeof(namelen));
+ 
+ 	/* 4th:  template name */
+-	ima_putc(m, template_name, namelen);
++	ima_putc(m, template_name, strlen(template_name));
+ 
+ 	/* 5th:  template length (except for 'ima' template) */
+ 	if (strcmp(template_name, IMA_TEMPLATE_IMA_NAME) == 0)
+ 		is_ima_template = true;
+ 
+-	if (!is_ima_template)
+-		ima_putc(m, &e->template_data_len,
+-			 sizeof(e->template_data_len));
++	if (!is_ima_template) {
++		template_data_len = !ima_canonical_fmt ? e->template_data_len :
++			cpu_to_le32(e->template_data_len);
++		ima_putc(m, &template_data_len, sizeof(e->template_data_len));
++	}
+ 
+ 	/* 6th:  template specific data */
+ 	for (i = 0; i < e->template_desc->num_fields; i++) {
+@@ -309,16 +326,11 @@ static ssize_t ima_write_policy(struct f
+ 	if (*ppos != 0)
+ 		goto out;
+ 
+-	result = -ENOMEM;
+-	data = kmalloc(datalen + 1, GFP_KERNEL);
+-	if (!data)
++	data = memdup_user_nul(buf, datalen);
++	if (IS_ERR(data)) {
++		result = PTR_ERR(data);
+ 		goto out;
+-
+-	*(data + datalen) = '\0';
+-
+-	result = -EFAULT;
+-	if (copy_from_user(data, buf, datalen))
+-		goto out_free;
++	}
+ 
+ 	result = mutex_lock_interruptible(&ima_write_mutex);
+ 	if (result < 0)
+@@ -327,7 +339,7 @@ static ssize_t ima_write_policy(struct f
+ 	if (data[0] == '/') {
+ 		result = ima_read_policy(data);
+ 	} else if (ima_appraise & IMA_APPRAISE_POLICY) {
+-		pr_err("IMA: signed policy file (specified as an absolute pathname) required\n");
++		pr_err("signed policy file (specified as an absolute pathname) required\n");
+ 		integrity_audit_msg(AUDIT_INTEGRITY_STATUS, NULL, NULL,
+ 				    "policy_update", "signed policy required",
+ 				    1, 0);
+@@ -347,6 +359,7 @@ out:
+ }
+ 
+ static struct dentry *ima_dir;
++static struct dentry *ima_symlink;
+ static struct dentry *binary_runtime_measurements;
+ static struct dentry *ascii_runtime_measurements;
+ static struct dentry *runtime_measurements_count;
+@@ -401,14 +414,14 @@ static int ima_release_policy(struct ino
+ 	const char *cause = valid_policy ? "completed" : "failed";
+ 
+ 	if ((file->f_flags & O_ACCMODE) == O_RDONLY)
+-		return 0;
++		return seq_release(inode, file);
+ 
+ 	if (valid_policy && ima_check_policy() < 0) {
+ 		cause = "failed";
+ 		valid_policy = 0;
+ 	}
+ 
+-	pr_info("IMA: policy update %s\n", cause);
++	pr_info("policy update %s\n", cause);
+ 	integrity_audit_msg(AUDIT_INTEGRITY_STATUS, NULL, NULL,
+ 			    "policy_update", cause, !valid_policy, 0);
+ 
+@@ -420,11 +433,13 @@ static int ima_release_policy(struct ino
+ 	}
+ 
+ 	ima_update_policy();
+-#ifndef	CONFIG_IMA_WRITE_POLICY
++#if !defined(CONFIG_IMA_WRITE_POLICY) && !defined(CONFIG_IMA_READ_POLICY)
+ 	securityfs_remove(ima_policy);
+ 	ima_policy = NULL;
+-#else
++#elif defined(CONFIG_IMA_WRITE_POLICY)
+ 	clear_bit(IMA_FS_BUSY, &ima_fs_flags);
++#elif defined(CONFIG_IMA_READ_POLICY)
++	inode->i_mode &= ~S_IWUSR;
+ #endif
+ 	return 0;
+ }
+@@ -439,10 +454,15 @@ static const struct file_operations ima_
+ 
+ int __init ima_fs_init(void)
+ {
+-	ima_dir = securityfs_create_dir("ima", NULL);
++	ima_dir = securityfs_create_dir("ima", integrity_dir);
+ 	if (IS_ERR(ima_dir))
+ 		return -1;
+ 
++	ima_symlink = securityfs_create_symlink("ima", NULL, "integrity/ima",
++						NULL);
++	if (IS_ERR(ima_symlink))
++		goto out;
++
+ 	binary_runtime_measurements =
+ 	    securityfs_create_file("binary_runtime_measurements",
+ 				   S_IRUSR | S_IRGRP, ima_dir, NULL,
+@@ -482,6 +502,7 @@ out:
+ 	securityfs_remove(runtime_measurements_count);
+ 	securityfs_remove(ascii_runtime_measurements);
+ 	securityfs_remove(binary_runtime_measurements);
++	securityfs_remove(ima_symlink);
+ 	securityfs_remove(ima_dir);
+ 	securityfs_remove(ima_policy);
+ 	return -1;
+diff -Nurp 4.9.0/integrity/ima/ima.h 4.19.98/integrity/ima/ima.h
+--- 4.9.0/integrity/ima/ima.h	2020-03-14 21:09:21.993540503 +0800
++++ 4.19.98/integrity/ima/ima.h	2020-03-14 20:52:04.881839999 +0800
+@@ -28,6 +28,10 @@
+ 
+ #include "../integrity.h"
+ 
++#ifdef CONFIG_HAVE_IMA_KEXEC
++#include <asm/ima.h>
++#endif
++
+ enum ima_show_type { IMA_SHOW_BINARY, IMA_SHOW_BINARY_NO_FIELD_LEN,
+ 		     IMA_SHOW_BINARY_OLD_STRING_FMT, IMA_SHOW_ASCII };
+ enum tpm_pcrs { TPM_PCR0 = 0, TPM_PCR8 = 8 };
+@@ -49,10 +53,9 @@ enum tpm_pcrs { TPM_PCR0 = 0, TPM_PCR8 =
+ extern int ima_policy_flag;
+ 
+ /* set during initialization */
+-extern int ima_initialized;
+-extern int ima_used_chip;
+ extern int ima_hash_algo;
+ extern int ima_appraise;
++extern struct tpm_chip *ima_tpm_chip;
+ 
+ /* IMA event related data */
+ struct ima_event_data {
+@@ -81,6 +84,7 @@ struct ima_template_field {
+ 
+ /* IMA template descriptor definition */
+ struct ima_template_desc {
++	struct list_head list;
+ 	char *name;
+ 	char *fmt;
+ 	int num_fields;
+@@ -102,6 +106,27 @@ struct ima_queue_entry {
+ };
+ extern struct list_head ima_measurements;	/* list of all measurements */
+ 
++/* Some details preceding the binary serialized measurement list */
++struct ima_kexec_hdr {
++	u16 version;
++	u16 _reserved0;
++	u32 _reserved1;
++	u64 buffer_size;
++	u64 count;
++};
++
++#ifdef CONFIG_HAVE_IMA_KEXEC
++void ima_load_kexec_buffer(void);
++#else
++static inline void ima_load_kexec_buffer(void) {}
++#endif /* CONFIG_HAVE_IMA_KEXEC */
++
++/*
++ * The default binary_runtime_measurements list format is defined as the
++ * platform native format.  The canonical format is defined as little-endian.
++ */
++extern bool ima_canonical_fmt;
++
+ /* Internal IMA function definitions */
+ int ima_init(void);
+ int ima_fs_init(void);
+@@ -122,7 +147,12 @@ int ima_init_crypto(void);
+ void ima_putc(struct seq_file *m, void *data, int datalen);
+ void ima_print_digest(struct seq_file *m, u8 *digest, u32 size);
+ struct ima_template_desc *ima_template_desc_current(void);
++int ima_restore_measurement_entry(struct ima_template_entry *entry);
++int ima_restore_measurement_list(loff_t bufsize, void *buf);
++int ima_measurements_show(struct seq_file *m, void *v);
++unsigned long ima_get_binary_runtime_size(void);
+ int ima_init_template(void);
++void ima_init_template_list(void);
+ 
+ /*
+  * used to protect h_table and sha_table
+@@ -141,22 +171,28 @@ static inline unsigned long ima_hash_key
+ 	return hash_long(*digest, IMA_HASH_BITS);
+ }
+ 
++#define __ima_hooks(hook)		\
++	hook(NONE)			\
++	hook(FILE_CHECK)		\
++	hook(MMAP_CHECK)		\
++	hook(BPRM_CHECK)		\
++	hook(CREDS_CHECK)		\
++	hook(POST_SETATTR)		\
++	hook(MODULE_CHECK)		\
++	hook(FIRMWARE_CHECK)		\
++	hook(KEXEC_KERNEL_CHECK)	\
++	hook(KEXEC_INITRAMFS_CHECK)	\
++	hook(POLICY_CHECK)		\
++	hook(MAX_CHECK)
++#define __ima_hook_enumify(ENUM)	ENUM,
++
+ enum ima_hooks {
+-	FILE_CHECK = 1,
+-	MMAP_CHECK,
+-	BPRM_CHECK,
+-	POST_SETATTR,
+-	MODULE_CHECK,
+-	FIRMWARE_CHECK,
+-	KEXEC_KERNEL_CHECK,
+-	KEXEC_INITRAMFS_CHECK,
+-	POLICY_CHECK,
+-	MAX_CHECK
++	__ima_hooks(__ima_hook_enumify)
+ };
+ 
+ /* LIM API function definitions */
+-int ima_get_action(struct inode *inode, int mask,
+-		   enum ima_hooks func, int *pcr);
++int ima_get_action(struct inode *inode, const struct cred *cred, u32 secid,
++		   int mask, enum ima_hooks func, int *pcr);
+ int ima_must_measure(struct inode *inode, int mask, enum ima_hooks func);
+ int ima_collect_measurement(struct integrity_iint_cache *iint,
+ 			    struct file *file, void *buf, loff_t size,
+@@ -173,11 +209,11 @@ int ima_store_template(struct ima_templa
+ 		       struct inode *inode,
+ 		       const unsigned char *filename, int pcr);
+ void ima_free_template_entry(struct ima_template_entry *entry);
+-const char *ima_d_path(const struct path *path, char **pathbuf);
++const char *ima_d_path(const struct path *path, char **pathbuf, char *filename);
+ 
+ /* IMA policy related functions */
+-int ima_match_policy(struct inode *inode, enum ima_hooks func, int mask,
+-		     int flags, int *pcr);
++int ima_match_policy(struct inode *inode, const struct cred *cred, u32 secid,
++		     enum ima_hooks func, int mask, int flags, int *pcr);
+ void ima_init_policy(void);
+ void ima_update_policy(void);
+ void ima_update_policy_flag(void);
+@@ -196,13 +232,14 @@ int ima_policy_show(struct seq_file *m,
+ #define IMA_APPRAISE_MODULES	0x08
+ #define IMA_APPRAISE_FIRMWARE	0x10
+ #define IMA_APPRAISE_POLICY	0x20
++#define IMA_APPRAISE_KEXEC	0x40
+ 
+ #ifdef CONFIG_IMA_APPRAISE
+ int ima_appraise_measurement(enum ima_hooks func,
+ 			     struct integrity_iint_cache *iint,
+ 			     struct file *file, const unsigned char *filename,
+ 			     struct evm_ima_xattr_data *xattr_value,
+-			     int xattr_len, int opened);
++			     int xattr_len);
+ int ima_must_appraise(struct inode *inode, int mask, enum ima_hooks func);
+ void ima_update_xattr(struct integrity_iint_cache *iint, struct file *file);
+ enum integrity_status ima_get_cache_status(struct integrity_iint_cache *iint,
+@@ -218,7 +255,7 @@ static inline int ima_appraise_measureme
+ 					   struct file *file,
+ 					   const unsigned char *filename,
+ 					   struct evm_ima_xattr_data *xattr_value,
+-					   int xattr_len, int opened)
++					   int xattr_len)
+ {
+ 	return INTEGRITY_UNKNOWN;
+ }
+@@ -253,7 +290,7 @@ static inline int ima_read_xattr(struct
+ 	return 0;
+ }
+ 
+-#endif
++#endif /* CONFIG_IMA_APPRAISE */
+ 
+ /* LSM based policy rules require audit */
+ #ifdef CONFIG_IMA_LSM_RULES
+@@ -275,12 +312,12 @@ static inline int security_filter_rule_m
+ {
+ 	return -EINVAL;
+ }
+-#endif /* CONFIG_IMA_TRUSTED_KEYRING */
++#endif /* CONFIG_IMA_LSM_RULES */
+ 
+ #ifdef	CONFIG_IMA_READ_POLICY
+ #define	POLICY_FILE_FLAGS	(S_IWUSR | S_IRUSR)
+ #else
+ #define	POLICY_FILE_FLAGS	S_IWUSR
+-#endif /* CONFIG_IMA_WRITE_POLICY */
++#endif /* CONFIG_IMA_READ_POLICY */
+ 
+ #endif /* __LINUX_IMA_H */
+diff -Nurp 4.9.0/integrity/ima/ima_init.c 4.19.98/integrity/ima/ima_init.c
+--- 4.9.0/integrity/ima/ima_init.c	2020-03-14 21:09:21.993540503 +0800
++++ 4.19.98/integrity/ima/ima_init.c	2020-03-14 20:52:04.881839999 +0800
+@@ -26,7 +26,7 @@
+ 
+ /* name for boot aggregate entry */
+ static const char *boot_aggregate_name = "boot_aggregate";
+-int ima_used_chip;
++struct tpm_chip *ima_tpm_chip;
+ 
+ /* Add the boot aggregate to the IMA measurement list and extend
+  * the PCR register.
+@@ -64,7 +64,7 @@ static int __init ima_add_boot_aggregate
+ 	iint->ima_hash->algo = HASH_ALGO_SHA1;
+ 	iint->ima_hash->length = SHA1_DIGEST_SIZE;
+ 
+-	if (ima_used_chip) {
++	if (ima_tpm_chip) {
+ 		result = ima_calc_boot_aggregate(&hash.hdr);
+ 		if (result < 0) {
+ 			audit_cause = "hashing_error";
+@@ -106,15 +106,10 @@ void __init ima_load_x509(void)
+ 
+ int __init ima_init(void)
+ {
+-	u8 pcr_i[TPM_DIGEST_SIZE];
+ 	int rc;
+ 
+-	ima_used_chip = 0;
+-	rc = tpm_pcr_read(TPM_ANY_NUM, 0, pcr_i);
+-	if (rc == 0)
+-		ima_used_chip = 1;
+-
+-	if (!ima_used_chip)
++	ima_tpm_chip = tpm_default_chip();
++	if (!ima_tpm_chip)
+ 		pr_info("No TPM chip found, activating TPM-bypass!\n");
+ 
+ 	rc = integrity_init_keyring(INTEGRITY_KEYRING_IMA);
+@@ -128,6 +123,8 @@ int __init ima_init(void)
+ 	if (rc != 0)
+ 		return rc;
+ 
++	ima_load_kexec_buffer();
++
+ 	rc = ima_add_boot_aggregate();	/* boot aggregate must be first entry */
+ 	if (rc != 0)
+ 		return rc;
+diff -Nurp 4.9.0/integrity/ima/ima_kexec.c 4.19.98/integrity/ima/ima_kexec.c
+--- 4.9.0/integrity/ima/ima_kexec.c	1970-01-01 08:00:00.000000000 +0800
++++ 4.19.98/integrity/ima/ima_kexec.c	2020-03-14 20:52:04.881839999 +0800
+@@ -0,0 +1,170 @@
++/*
++ * Copyright (C) 2016 IBM Corporation
++ *
++ * Authors:
++ * Thiago Jung Bauermann <bauerman@linux.vnet.ibm.com>
++ * Mimi Zohar <zohar@linux.vnet.ibm.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ */
++#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
++
++#include <linux/seq_file.h>
++#include <linux/vmalloc.h>
++#include <linux/kexec.h>
++#include "ima.h"
++
++#ifdef CONFIG_IMA_KEXEC
++static int ima_dump_measurement_list(unsigned long *buffer_size, void **buffer,
++				     unsigned long segment_size)
++{
++	struct ima_queue_entry *qe;
++	struct seq_file file;
++	struct ima_kexec_hdr khdr;
++	int ret = 0;
++
++	/* segment size can't change between kexec load and execute */
++	file.buf = vmalloc(segment_size);
++	if (!file.buf) {
++		ret = -ENOMEM;
++		goto out;
++	}
++
++	file.size = segment_size;
++	file.read_pos = 0;
++	file.count = sizeof(khdr);	/* reserved space */
++
++	memset(&khdr, 0, sizeof(khdr));
++	khdr.version = 1;
++	list_for_each_entry_rcu(qe, &ima_measurements, later) {
++		if (file.count < file.size) {
++			khdr.count++;
++			ima_measurements_show(&file, qe);
++		} else {
++			ret = -EINVAL;
++			break;
++		}
++	}
++
++	if (ret < 0)
++		goto out;
++
++	/*
++	 * fill in reserved space with some buffer details
++	 * (eg. version, buffer size, number of measurements)
++	 */
++	khdr.buffer_size = file.count;
++	if (ima_canonical_fmt) {
++		khdr.version = cpu_to_le16(khdr.version);
++		khdr.count = cpu_to_le64(khdr.count);
++		khdr.buffer_size = cpu_to_le64(khdr.buffer_size);
++	}
++	memcpy(file.buf, &khdr, sizeof(khdr));
++
++	print_hex_dump(KERN_DEBUG, "ima dump: ", DUMP_PREFIX_NONE,
++			16, 1, file.buf,
++			file.count < 100 ? file.count : 100, true);
++
++	*buffer_size = file.count;
++	*buffer = file.buf;
++out:
++	if (ret == -EINVAL)
++		vfree(file.buf);
++	return ret;
++}
++
++/*
++ * Called during kexec_file_load so that IMA can add a segment to the kexec
++ * image for the measurement list for the next kernel.
++ *
++ * This function assumes that kexec_mutex is held.
++ */
++void ima_add_kexec_buffer(struct kimage *image)
++{
++	struct kexec_buf kbuf = { .image = image, .buf_align = PAGE_SIZE,
++				  .buf_min = 0, .buf_max = ULONG_MAX,
++				  .top_down = true };
++	unsigned long binary_runtime_size;
++
++	/* use more understandable variable names than defined in kbuf */
++	void *kexec_buffer = NULL;
++	size_t kexec_buffer_size;
++	size_t kexec_segment_size;
++	int ret;
++
++	/*
++	 * Reserve an extra half page of memory for additional measurements
++	 * added during the kexec load.
++	 */
++	binary_runtime_size = ima_get_binary_runtime_size();
++	if (binary_runtime_size >= ULONG_MAX - PAGE_SIZE)
++		kexec_segment_size = ULONG_MAX;
++	else
++		kexec_segment_size = ALIGN(ima_get_binary_runtime_size() +
++					   PAGE_SIZE / 2, PAGE_SIZE);
++	if ((kexec_segment_size == ULONG_MAX) ||
++	    ((kexec_segment_size >> PAGE_SHIFT) > totalram_pages / 2)) {
++		pr_err("Binary measurement list too large.\n");
++		return;
++	}
++
++	ima_dump_measurement_list(&kexec_buffer_size, &kexec_buffer,
++				  kexec_segment_size);
++	if (!kexec_buffer) {
++		pr_err("Not enough memory for the kexec measurement buffer.\n");
++		return;
++	}
++
++	kbuf.buffer = kexec_buffer;
++	kbuf.bufsz = kexec_buffer_size;
++	kbuf.memsz = kexec_segment_size;
++	ret = kexec_add_buffer(&kbuf);
++	if (ret) {
++		pr_err("Error passing over kexec measurement buffer.\n");
++		return;
++	}
++
++	ret = arch_ima_add_kexec_buffer(image, kbuf.mem, kexec_segment_size);
++	if (ret) {
++		pr_err("Error passing over kexec measurement buffer.\n");
++		return;
++	}
++
++	pr_debug("kexec measurement buffer for the loaded kernel at 0x%lx.\n",
++		 kbuf.mem);
++}
++#endif /* IMA_KEXEC */
++
++/*
++ * Restore the measurement list from the previous kernel.
++ */
++void ima_load_kexec_buffer(void)
++{
++	void *kexec_buffer = NULL;
++	size_t kexec_buffer_size = 0;
++	int rc;
++
++	rc = ima_get_kexec_buffer(&kexec_buffer, &kexec_buffer_size);
++	switch (rc) {
++	case 0:
++		rc = ima_restore_measurement_list(kexec_buffer_size,
++						  kexec_buffer);
++		if (rc != 0)
++			pr_err("Failed to restore the measurement list: %d\n",
++				rc);
++
++		ima_free_kexec_buffer();
++		break;
++	case -ENOTSUPP:
++		pr_debug("Restoring the measurement list not supported\n");
++		break;
++	case -ENOENT:
++		pr_debug("No measurement list to restore\n");
++		break;
++	default:
++		pr_debug("Error restoring the measurement list: %d\n", rc);
++	}
++}
+diff -Nurp 4.9.0/integrity/ima/ima_main.c 4.19.98/integrity/ima/ima_main.c
+--- 4.9.0/integrity/ima/ima_main.c	2020-03-14 21:09:21.993540503 +0800
++++ 4.19.98/integrity/ima/ima_main.c	2020-03-14 20:52:04.881839999 +0800
+@@ -16,6 +16,9 @@
+  *	implements the IMA hooks: ima_bprm_check, ima_file_mmap,
+  *	and ima_file_check.
+  */
++
++#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
++
+ #include <linux/module.h>
+ #include <linux/file.h>
+ #include <linux/binfmts.h>
+@@ -24,11 +27,11 @@
+ #include <linux/slab.h>
+ #include <linux/xattr.h>
+ #include <linux/ima.h>
++#include <linux/iversion.h>
++#include <linux/fs.h>
+ 
+ #include "ima.h"
+ 
+-int ima_initialized;
+-
+ #ifdef CONFIG_IMA_APPRAISE
+ int ima_appraise = IMA_APPRAISE_ENFORCE;
+ #else
+@@ -51,15 +54,16 @@ static int __init hash_setup(char *str)
+ 			ima_hash_algo = HASH_ALGO_SHA1;
+ 		else if (strncmp(str, "md5", 3) == 0)
+ 			ima_hash_algo = HASH_ALGO_MD5;
++		else
++			return 1;
+ 		goto out;
+ 	}
+ 
+-	for (i = 0; i < HASH_ALGO__LAST; i++) {
+-		if (strcmp(str, hash_algo_name[i]) == 0) {
+-			ima_hash_algo = i;
+-			break;
+-		}
+-	}
++	i = match_string(hash_algo_name, HASH_ALGO__LAST, str);
++	if (i < 0)
++		return 1;
++
++	ima_hash_algo = i;
+ out:
+ 	hash_setup_done = 1;
+ 	return 1;
+@@ -80,7 +84,8 @@ static void ima_rdwr_violation_check(str
+ 				     struct integrity_iint_cache *iint,
+ 				     int must_measure,
+ 				     char **pathbuf,
+-				     const char **pathname)
++				     const char **pathname,
++				     char *filename)
+ {
+ 	struct inode *inode = file_inode(file);
+ 	fmode_t mode = file->f_mode;
+@@ -91,10 +96,13 @@ static void ima_rdwr_violation_check(str
+ 			if (!iint)
+ 				iint = integrity_iint_find(inode);
+ 			/* IMA_MEASURE is set from reader side */
+-			if (iint && (iint->flags & IMA_MEASURE))
++			if (iint && test_bit(IMA_MUST_MEASURE,
++						&iint->atomic_flags))
+ 				send_tomtou = true;
+ 		}
+ 	} else {
++		if (must_measure)
++			set_bit(IMA_MUST_MEASURE, &iint->atomic_flags);
+ 		if ((atomic_read(&inode->i_writecount) > 0) && must_measure)
+ 			send_writers = true;
+ 	}
+@@ -102,7 +110,7 @@ static void ima_rdwr_violation_check(str
+ 	if (!send_tomtou && !send_writers)
+ 		return;
+ 
+-	*pathname = ima_d_path(&file->f_path, pathbuf);
++	*pathname = ima_d_path(&file->f_path, pathbuf, filename);
+ 
+ 	if (send_tomtou)
+ 		ima_add_violation(file, *pathname, iint,
+@@ -116,21 +124,25 @@ static void ima_check_last_writer(struct
+ 				  struct inode *inode, struct file *file)
+ {
+ 	fmode_t mode = file->f_mode;
++	bool update;
+ 
+ 	if (!(mode & FMODE_WRITE))
+ 		return;
+ 
+-	inode_lock(inode);
++	mutex_lock(&iint->mutex);
+ 	if (atomic_read(&inode->i_writecount) == 1) {
+-		if ((iint->version != inode->i_version) ||
++		update = test_and_clear_bit(IMA_UPDATE_XATTR,
++					    &iint->atomic_flags);
++		if (!IS_I_VERSION(inode) ||
++		    !inode_eq_iversion(inode, iint->version) ||
+ 		    (iint->flags & IMA_NEW_FILE)) {
+ 			iint->flags &= ~(IMA_DONE_MASK | IMA_NEW_FILE);
+ 			iint->measured_pcrs = 0;
+-			if (iint->flags & IMA_APPRAISE)
++			if (update)
+ 				ima_update_xattr(iint, file);
+ 		}
+ 	}
+-	inode_unlock(inode);
++	mutex_unlock(&iint->mutex);
+ }
+ 
+ /**
+@@ -154,15 +166,17 @@ void ima_file_free(struct file *file)
+ 	ima_check_last_writer(iint, inode, file);
+ }
+ 
+-static int process_measurement(struct file *file, char *buf, loff_t size,
+-			       int mask, enum ima_hooks func, int opened)
++static int process_measurement(struct file *file, const struct cred *cred,
++			       u32 secid, char *buf, loff_t size, int mask,
++			       enum ima_hooks func)
+ {
+ 	struct inode *inode = file_inode(file);
+ 	struct integrity_iint_cache *iint = NULL;
+ 	struct ima_template_desc *template_desc;
+ 	char *pathbuf = NULL;
++	char filename[NAME_MAX];
+ 	const char *pathname = NULL;
+-	int rc = -ENOMEM, action, must_appraise;
++	int rc = 0, action, must_appraise = 0;
+ 	int pcr = CONFIG_IMA_MEASURE_PCR_IDX;
+ 	struct evm_ima_xattr_data *xattr_value = NULL;
+ 	int xattr_len = 0;
+@@ -176,7 +190,7 @@ static int process_measurement(struct fi
+ 	 * bitmask based on the appraise/audit/measurement policy.
+ 	 * Included is the appraise submask.
+ 	 */
+-	action = ima_get_action(inode, mask, func, &pcr);
++	action = ima_get_action(inode, cred, secid, mask, func, &pcr);
+ 	violation_check = ((func == FILE_CHECK || func == MMAP_CHECK) &&
+ 			   (ima_policy_flag & IMA_MEASURE));
+ 	if (!action && !violation_check)
+@@ -193,16 +207,39 @@ static int process_measurement(struct fi
+ 	if (action) {
+ 		iint = integrity_inode_get(inode);
+ 		if (!iint)
+-			goto out;
++			rc = -ENOMEM;
+ 	}
+ 
+-	if (violation_check) {
++	if (!rc && violation_check)
+ 		ima_rdwr_violation_check(file, iint, action & IMA_MEASURE,
+-					 &pathbuf, &pathname);
+-		if (!action) {
+-			rc = 0;
+-			goto out_free;
+-		}
++					 &pathbuf, &pathname, filename);
++
++	inode_unlock(inode);
++
++	if (rc)
++		goto out;
++	if (!action)
++		goto out;
++
++	mutex_lock(&iint->mutex);
++
++	if (test_and_clear_bit(IMA_CHANGE_ATTR, &iint->atomic_flags))
++		/* reset appraisal flags if ima_inode_post_setattr was called */
++		iint->flags &= ~(IMA_APPRAISE | IMA_APPRAISED |
++				 IMA_APPRAISE_SUBMASK | IMA_APPRAISED_SUBMASK |
++				 IMA_ACTION_FLAGS);
++
++	/*
++	 * Re-evaulate the file if either the xattr has changed or the
++	 * kernel has no way of detecting file change on the filesystem.
++	 * (Limited to privileged mounted filesystems.)
++	 */
++	if (test_and_clear_bit(IMA_CHANGE_XATTR, &iint->atomic_flags) ||
++	    ((inode->i_sb->s_iflags & SB_I_IMA_UNVERIFIABLE_SIGNATURE) &&
++	     !(inode->i_sb->s_iflags & SB_I_UNTRUSTED_MOUNTER) &&
++	     !(action & IMA_FAIL_UNVERIFIABLE_SIGS))) {
++		iint->flags &= ~IMA_DONE_MASK;
++		iint->measured_pcrs = 0;
+ 	}
+ 
+ 	/* Determine if already appraised/measured based on bitmask
+@@ -217,11 +254,23 @@ static int process_measurement(struct fi
+ 	if ((action & IMA_MEASURE) && (iint->measured_pcrs & (0x1 << pcr)))
+ 		action ^= IMA_MEASURE;
+ 
++	/* HASH sets the digital signature and update flags, nothing else */
++	if ((action & IMA_HASH) &&
++	    !(test_bit(IMA_DIGSIG, &iint->atomic_flags))) {
++		xattr_len = ima_read_xattr(file_dentry(file), &xattr_value);
++		if ((xattr_value && xattr_len > 2) &&
++		    (xattr_value->type == EVM_IMA_XATTR_DIGSIG))
++			set_bit(IMA_DIGSIG, &iint->atomic_flags);
++		iint->flags |= IMA_HASHED;
++		action ^= IMA_HASH;
++		set_bit(IMA_UPDATE_XATTR, &iint->atomic_flags);
++	}
++
+ 	/* Nothing to do, just return existing appraised status */
+ 	if (!action) {
+ 		if (must_appraise)
+ 			rc = ima_get_cache_status(iint, func);
+-		goto out_digsig;
++		goto out_locked;
+ 	}
+ 
+ 	template_desc = ima_template_desc_current();
+@@ -233,36 +282,41 @@ static int process_measurement(struct fi
+ 	hash_algo = ima_get_hash_algo(xattr_value, xattr_len);
+ 
+ 	rc = ima_collect_measurement(iint, file, buf, size, hash_algo);
+-	if (rc != 0) {
+-		if (file->f_flags & O_DIRECT)
+-			rc = (iint->flags & IMA_PERMIT_DIRECTIO) ? 0 : -EACCES;
+-		goto out_digsig;
+-	}
++	if (rc != 0 && rc != -EBADF && rc != -EINVAL)
++		goto out_locked;
+ 
+-	if (!pathname)	/* ima_rdwr_violation possibly pre-fetched */
+-		pathname = ima_d_path(&file->f_path, &pathbuf);
++	if (!pathbuf)	/* ima_rdwr_violation possibly pre-fetched */
++		pathname = ima_d_path(&file->f_path, &pathbuf, filename);
+ 
+ 	if (action & IMA_MEASURE)
+ 		ima_store_measurement(iint, file, pathname,
+ 				      xattr_value, xattr_len, pcr);
+-	if (action & IMA_APPRAISE_SUBMASK)
++	if (rc == 0 && (action & IMA_APPRAISE_SUBMASK)) {
++		inode_lock(inode);
+ 		rc = ima_appraise_measurement(func, iint, file, pathname,
+-					      xattr_value, xattr_len, opened);
++					      xattr_value, xattr_len);
++		inode_unlock(inode);
++	}
+ 	if (action & IMA_AUDIT)
+ 		ima_audit_measurement(iint, pathname);
+ 
+-out_digsig:
+-	if ((mask & MAY_WRITE) && (iint->flags & IMA_DIGSIG) &&
++	if ((file->f_flags & O_DIRECT) && (iint->flags & IMA_PERMIT_DIRECTIO))
++		rc = 0;
++out_locked:
++	if ((mask & MAY_WRITE) && test_bit(IMA_DIGSIG, &iint->atomic_flags) &&
+ 	     !(iint->flags & IMA_NEW_FILE))
+ 		rc = -EACCES;
++	mutex_unlock(&iint->mutex);
+ 	kfree(xattr_value);
+-out_free:
++out:
+ 	if (pathbuf)
+ 		__putname(pathbuf);
+-out:
+-	inode_unlock(inode);
+-	if ((rc && must_appraise) && (ima_appraise & IMA_APPRAISE_ENFORCE))
+-		return -EACCES;
++	if (must_appraise) {
++		if (rc && (ima_appraise & IMA_APPRAISE_ENFORCE))
++			return -EACCES;
++		if (file->f_mode & FMODE_WRITE)
++			set_bit(IMA_UPDATE_XATTR, &iint->atomic_flags);
++	}
+ 	return 0;
+ }
+ 
+@@ -279,9 +333,14 @@ out:
+  */
+ int ima_file_mmap(struct file *file, unsigned long prot)
+ {
+-	if (file && (prot & PROT_EXEC))
+-		return process_measurement(file, NULL, 0, MAY_EXEC,
+-					   MMAP_CHECK, 0);
++	u32 secid;
++
++	if (file && (prot & PROT_EXEC)) {
++		security_task_getsecid(current, &secid);
++		return process_measurement(file, current_cred(), secid, NULL,
++					   0, MAY_EXEC, MMAP_CHECK);
++	}
++
+ 	return 0;
+ }
+ 
+@@ -300,25 +359,38 @@ int ima_file_mmap(struct file *file, uns
+  */
+ int ima_bprm_check(struct linux_binprm *bprm)
+ {
+-	return process_measurement(bprm->file, NULL, 0, MAY_EXEC,
+-				   BPRM_CHECK, 0);
++	int ret;
++	u32 secid;
++
++	security_task_getsecid(current, &secid);
++	ret = process_measurement(bprm->file, current_cred(), secid, NULL, 0,
++				  MAY_EXEC, BPRM_CHECK);
++	if (ret)
++		return ret;
++
++	security_cred_getsecid(bprm->cred, &secid);
++	return process_measurement(bprm->file, bprm->cred, secid, NULL, 0,
++				   MAY_EXEC, CREDS_CHECK);
+ }
+ 
+ /**
+  * ima_path_check - based on policy, collect/store measurement.
+  * @file: pointer to the file to be measured
+- * @mask: contains MAY_READ, MAY_WRITE or MAY_EXECUTE
++ * @mask: contains MAY_READ, MAY_WRITE, MAY_EXEC or MAY_APPEND
+  *
+  * Measure files based on the ima_must_measure() policy decision.
+  *
+  * On success return 0.  On integrity appraisal error, assuming the file
+  * is in policy and IMA-appraisal is in enforcing mode, return -EACCES.
+  */
+-int ima_file_check(struct file *file, int mask, int opened)
++int ima_file_check(struct file *file, int mask)
+ {
+-	return process_measurement(file, NULL, 0,
+-				   mask & (MAY_READ | MAY_WRITE | MAY_EXEC),
+-				   FILE_CHECK, opened);
++	u32 secid;
++
++	security_task_getsecid(current, &secid);
++	return process_measurement(file, current_cred(), secid, NULL, 0,
++				   mask & (MAY_READ | MAY_WRITE | MAY_EXEC |
++					   MAY_APPEND), FILE_CHECK);
+ }
+ EXPORT_SYMBOL_GPL(ima_file_check);
+ 
+@@ -357,19 +429,20 @@ void ima_post_path_mknod(struct dentry *
+  */
+ int ima_read_file(struct file *file, enum kernel_read_file_id read_id)
+ {
+-	if (!file && read_id == READING_MODULE) {
+-#ifndef CONFIG_MODULE_SIG_FORCE
+-		if ((ima_appraise & IMA_APPRAISE_MODULES) &&
+-		    (ima_appraise & IMA_APPRAISE_ENFORCE))
+-			return -EACCES;	/* INTEGRITY_UNKNOWN */
+-#endif
+-		return 0;	/* We rely on module signature checking */
+-	}
++	/*
++	 * READING_FIRMWARE_PREALLOC_BUFFER
++	 *
++	 * Do devices using pre-allocated memory run the risk of the
++	 * firmware being accessible to the device prior to the completion
++	 * of IMA's signature verification any more than when using two
++	 * buffers?
++	 */
+ 	return 0;
+ }
+ 
+ static int read_idmap[READING_MAX_ID] = {
+ 	[READING_FIRMWARE] = FIRMWARE_CHECK,
++	[READING_FIRMWARE_PREALLOC_BUFFER] = FIRMWARE_CHECK,
+ 	[READING_MODULE] = MODULE_CHECK,
+ 	[READING_KEXEC_IMAGE] = KEXEC_KERNEL_CHECK,
+ 	[READING_KEXEC_INITRAMFS] = KEXEC_INITRAMFS_CHECK,
+@@ -393,15 +466,19 @@ int ima_post_read_file(struct file *file
+ 		       enum kernel_read_file_id read_id)
+ {
+ 	enum ima_hooks func;
++	u32 secid;
+ 
+ 	if (!file && read_id == READING_FIRMWARE) {
+ 		if ((ima_appraise & IMA_APPRAISE_FIRMWARE) &&
+-		    (ima_appraise & IMA_APPRAISE_ENFORCE))
++		    (ima_appraise & IMA_APPRAISE_ENFORCE)) {
++			pr_err("Prevent firmware loading_store.\n");
+ 			return -EACCES;	/* INTEGRITY_UNKNOWN */
++		}
+ 		return 0;
+ 	}
+ 
+-	if (!file && read_id == READING_MODULE) /* MODULE_SIG_FORCE enabled */
++	/* permit signed certs */
++	if (!file && read_id == READING_X509_CERTIFICATE)
+ 		return 0;
+ 
+ 	if (!file || !buf || size == 0) { /* should never happen */
+@@ -411,19 +488,74 @@ int ima_post_read_file(struct file *file
+ 	}
+ 
+ 	func = read_idmap[read_id] ?: FILE_CHECK;
+-	return process_measurement(file, buf, size, MAY_READ, func, 0);
++	security_task_getsecid(current, &secid);
++	return process_measurement(file, current_cred(), secid, buf, size,
++				   MAY_READ, func);
++}
++
++/**
++ * ima_load_data - appraise decision based on policy
++ * @id: kernel load data caller identifier
++ *
++ * Callers of this LSM hook can not measure, appraise, or audit the
++ * data provided by userspace.  Enforce policy rules requring a file
++ * signature (eg. kexec'ed kernel image).
++ *
++ * For permission return 0, otherwise return -EACCES.
++ */
++int ima_load_data(enum kernel_load_data_id id)
++{
++	bool sig_enforce;
++
++	if ((ima_appraise & IMA_APPRAISE_ENFORCE) != IMA_APPRAISE_ENFORCE)
++		return 0;
++
++	switch (id) {
++	case LOADING_KEXEC_IMAGE:
++		if (ima_appraise & IMA_APPRAISE_KEXEC) {
++			pr_err("impossible to appraise a kernel image without a file descriptor; try using kexec_file_load syscall.\n");
++			return -EACCES;	/* INTEGRITY_UNKNOWN */
++		}
++		break;
++	case LOADING_FIRMWARE:
++		if (ima_appraise & IMA_APPRAISE_FIRMWARE) {
++			pr_err("Prevent firmware sysfs fallback loading.\n");
++			return -EACCES;	/* INTEGRITY_UNKNOWN */
++		}
++		break;
++	case LOADING_MODULE:
++		sig_enforce = is_module_sig_enforced();
++
++		if (!sig_enforce && (ima_appraise & IMA_APPRAISE_MODULES)) {
++			pr_err("impossible to appraise a module without a file descriptor. sig_enforce kernel parameter might help\n");
++			return -EACCES;	/* INTEGRITY_UNKNOWN */
++		}
++	default:
++		break;
++	}
++	return 0;
+ }
+ 
+ static int __init init_ima(void)
+ {
+ 	int error;
+ 
++	ima_init_template_list();
+ 	hash_setup(CONFIG_IMA_DEFAULT_HASH);
+ 	error = ima_init();
+-	if (!error) {
+-		ima_initialized = 1;
+-		ima_update_policy_flag();
++
++	if (error && strcmp(hash_algo_name[ima_hash_algo],
++			    CONFIG_IMA_DEFAULT_HASH) != 0) {
++		pr_info("Allocating %s failed, going to use default hash algorithm %s\n",
++			hash_algo_name[ima_hash_algo], CONFIG_IMA_DEFAULT_HASH);
++		hash_setup_done = 0;
++		hash_setup(CONFIG_IMA_DEFAULT_HASH);
++		error = ima_init();
+ 	}
++
++	if (!error)
++		ima_update_policy_flag();
++
+ 	return error;
+ }
+ 
+diff -Nurp 4.9.0/integrity/ima/ima_mok.c 4.19.98/integrity/ima/ima_mok.c
+--- 4.9.0/integrity/ima/ima_mok.c	2020-03-14 21:09:21.993540503 +0800
++++ 4.19.98/integrity/ima/ima_mok.c	2020-03-14 20:52:04.881839999 +0800
+@@ -17,6 +17,7 @@
+ #include <linux/cred.h>
+ #include <linux/err.h>
+ #include <linux/init.h>
++#include <linux/slab.h>
+ #include <keys/system_keyring.h>
+ 
+ 
+@@ -27,15 +28,23 @@ struct key *ima_blacklist_keyring;
+  */
+ __init int ima_mok_init(void)
+ {
++	struct key_restriction *restriction;
++
+ 	pr_notice("Allocating IMA blacklist keyring.\n");
+ 
++	restriction = kzalloc(sizeof(struct key_restriction), GFP_KERNEL);
++	if (!restriction)
++		panic("Can't allocate IMA blacklist restriction.");
++
++	restriction->check = restrict_link_by_builtin_trusted;
++
+ 	ima_blacklist_keyring = keyring_alloc(".ima_blacklist",
+ 				KUIDT_INIT(0), KGIDT_INIT(0), current_cred(),
+ 				(KEY_POS_ALL & ~KEY_POS_SETATTR) |
+ 				KEY_USR_VIEW | KEY_USR_READ |
+ 				KEY_USR_WRITE | KEY_USR_SEARCH,
+ 				KEY_ALLOC_NOT_IN_QUOTA,
+-				restrict_link_by_builtin_trusted, NULL);
++				restriction, NULL);
+ 
+ 	if (IS_ERR(ima_blacklist_keyring))
+ 		panic("Can't allocate IMA blacklist keyring.");
+diff -Nurp 4.9.0/integrity/ima/ima_policy.c 4.19.98/integrity/ima/ima_policy.c
+--- 4.9.0/integrity/ima/ima_policy.c	2020-03-14 21:09:21.993540503 +0800
++++ 4.19.98/integrity/ima/ima_policy.c	2020-03-14 20:52:04.881839999 +0800
+@@ -33,6 +33,7 @@
+ #define IMA_INMASK	0x0040
+ #define IMA_EUID	0x0080
+ #define IMA_PCR		0x0100
++#define IMA_FSNAME	0x0200
+ 
+ #define UNKNOWN		0
+ #define MEASURE		0x0001	/* same as IMA_MEASURE */
+@@ -40,12 +41,15 @@
+ #define APPRAISE	0x0004	/* same as IMA_APPRAISE */
+ #define DONT_APPRAISE	0x0008
+ #define AUDIT		0x0040
++#define HASH		0x0100
++#define DONT_HASH	0x0200
+ 
+ #define INVALID_PCR(a) (((a) < 0) || \
+ 	(a) >= (FIELD_SIZEOF(struct integrity_iint_cache, measured_pcrs) * 8))
+ 
+ int ima_policy_flag;
+ static int temp_ima_appraise;
++static int build_ima_appraise __ro_after_init;
+ 
+ #define MAX_LSM_RULES 6
+ enum lsm_rule_types { LSM_OBJ_USER, LSM_OBJ_ROLE, LSM_OBJ_TYPE,
+@@ -61,15 +65,18 @@ struct ima_rule_entry {
+ 	enum ima_hooks func;
+ 	int mask;
+ 	unsigned long fsmagic;
+-	u8 fsuuid[16];
++	uuid_t fsuuid;
+ 	kuid_t uid;
+ 	kuid_t fowner;
++	bool (*uid_op)(kuid_t, kuid_t);    /* Handlers for operators       */
++	bool (*fowner_op)(kuid_t, kuid_t); /* uid_eq(), uid_gt(), uid_lt() */
+ 	int pcr;
+ 	struct {
+ 		void *rule;	/* LSM file metadata specific */
+ 		void *args_p;	/* audit value */
+ 		int type;	/* audit type */
+ 	} lsm[MAX_LSM_RULES];
++	char *fsname;
+ };
+ 
+ /*
+@@ -83,7 +90,7 @@ struct ima_rule_entry {
+  * normal users can easily run the machine out of memory simply building
+  * and running executables.
+  */
+-static struct ima_rule_entry dont_measure_rules[] = {
++static struct ima_rule_entry dont_measure_rules[] __ro_after_init = {
+ 	{.action = DONT_MEASURE, .fsmagic = PROC_SUPER_MAGIC, .flags = IMA_FSMAGIC},
+ 	{.action = DONT_MEASURE, .fsmagic = SYSFS_MAGIC, .flags = IMA_FSMAGIC},
+ 	{.action = DONT_MEASURE, .fsmagic = DEBUGFS_MAGIC, .flags = IMA_FSMAGIC},
+@@ -92,37 +99,43 @@ static struct ima_rule_entry dont_measur
+ 	{.action = DONT_MEASURE, .fsmagic = BINFMTFS_MAGIC, .flags = IMA_FSMAGIC},
+ 	{.action = DONT_MEASURE, .fsmagic = SECURITYFS_MAGIC, .flags = IMA_FSMAGIC},
+ 	{.action = DONT_MEASURE, .fsmagic = SELINUX_MAGIC, .flags = IMA_FSMAGIC},
++	{.action = DONT_MEASURE, .fsmagic = SMACK_MAGIC, .flags = IMA_FSMAGIC},
+ 	{.action = DONT_MEASURE, .fsmagic = CGROUP_SUPER_MAGIC,
+ 	 .flags = IMA_FSMAGIC},
++	{.action = DONT_MEASURE, .fsmagic = CGROUP2_SUPER_MAGIC,
++	 .flags = IMA_FSMAGIC},
+ 	{.action = DONT_MEASURE, .fsmagic = NSFS_MAGIC, .flags = IMA_FSMAGIC}
+ };
+ 
+-static struct ima_rule_entry original_measurement_rules[] = {
++static struct ima_rule_entry original_measurement_rules[] __ro_after_init = {
+ 	{.action = MEASURE, .func = MMAP_CHECK, .mask = MAY_EXEC,
+ 	 .flags = IMA_FUNC | IMA_MASK},
+ 	{.action = MEASURE, .func = BPRM_CHECK, .mask = MAY_EXEC,
+ 	 .flags = IMA_FUNC | IMA_MASK},
+ 	{.action = MEASURE, .func = FILE_CHECK, .mask = MAY_READ,
+-	 .uid = GLOBAL_ROOT_UID, .flags = IMA_FUNC | IMA_MASK | IMA_UID},
++	 .uid = GLOBAL_ROOT_UID, .uid_op = &uid_eq,
++	 .flags = IMA_FUNC | IMA_MASK | IMA_UID},
+ 	{.action = MEASURE, .func = MODULE_CHECK, .flags = IMA_FUNC},
+ 	{.action = MEASURE, .func = FIRMWARE_CHECK, .flags = IMA_FUNC},
+ };
+ 
+-static struct ima_rule_entry default_measurement_rules[] = {
++static struct ima_rule_entry default_measurement_rules[] __ro_after_init = {
+ 	{.action = MEASURE, .func = MMAP_CHECK, .mask = MAY_EXEC,
+ 	 .flags = IMA_FUNC | IMA_MASK},
+ 	{.action = MEASURE, .func = BPRM_CHECK, .mask = MAY_EXEC,
+ 	 .flags = IMA_FUNC | IMA_MASK},
+ 	{.action = MEASURE, .func = FILE_CHECK, .mask = MAY_READ,
+-	 .uid = GLOBAL_ROOT_UID, .flags = IMA_FUNC | IMA_INMASK | IMA_EUID},
++	 .uid = GLOBAL_ROOT_UID, .uid_op = &uid_eq,
++	 .flags = IMA_FUNC | IMA_INMASK | IMA_EUID},
+ 	{.action = MEASURE, .func = FILE_CHECK, .mask = MAY_READ,
+-	 .uid = GLOBAL_ROOT_UID, .flags = IMA_FUNC | IMA_INMASK | IMA_UID},
++	 .uid = GLOBAL_ROOT_UID, .uid_op = &uid_eq,
++	 .flags = IMA_FUNC | IMA_INMASK | IMA_UID},
+ 	{.action = MEASURE, .func = MODULE_CHECK, .flags = IMA_FUNC},
+ 	{.action = MEASURE, .func = FIRMWARE_CHECK, .flags = IMA_FUNC},
+ 	{.action = MEASURE, .func = POLICY_CHECK, .flags = IMA_FUNC},
+ };
+ 
+-static struct ima_rule_entry default_appraise_rules[] = {
++static struct ima_rule_entry default_appraise_rules[] __ro_after_init = {
+ 	{.action = DONT_APPRAISE, .fsmagic = PROC_SUPER_MAGIC, .flags = IMA_FSMAGIC},
+ 	{.action = DONT_APPRAISE, .fsmagic = SYSFS_MAGIC, .flags = IMA_FSMAGIC},
+ 	{.action = DONT_APPRAISE, .fsmagic = DEBUGFS_MAGIC, .flags = IMA_FSMAGIC},
+@@ -132,21 +145,54 @@ static struct ima_rule_entry default_app
+ 	{.action = DONT_APPRAISE, .fsmagic = BINFMTFS_MAGIC, .flags = IMA_FSMAGIC},
+ 	{.action = DONT_APPRAISE, .fsmagic = SECURITYFS_MAGIC, .flags = IMA_FSMAGIC},
+ 	{.action = DONT_APPRAISE, .fsmagic = SELINUX_MAGIC, .flags = IMA_FSMAGIC},
++	{.action = DONT_APPRAISE, .fsmagic = SMACK_MAGIC, .flags = IMA_FSMAGIC},
+ 	{.action = DONT_APPRAISE, .fsmagic = NSFS_MAGIC, .flags = IMA_FSMAGIC},
+ 	{.action = DONT_APPRAISE, .fsmagic = CGROUP_SUPER_MAGIC, .flags = IMA_FSMAGIC},
++	{.action = DONT_APPRAISE, .fsmagic = CGROUP2_SUPER_MAGIC, .flags = IMA_FSMAGIC},
+ #ifdef CONFIG_IMA_WRITE_POLICY
+ 	{.action = APPRAISE, .func = POLICY_CHECK,
+ 	.flags = IMA_FUNC | IMA_DIGSIG_REQUIRED},
+ #endif
+ #ifndef CONFIG_IMA_APPRAISE_SIGNED_INIT
+-	{.action = APPRAISE, .fowner = GLOBAL_ROOT_UID, .flags = IMA_FOWNER},
++	{.action = APPRAISE, .fowner = GLOBAL_ROOT_UID, .fowner_op = &uid_eq,
++	 .flags = IMA_FOWNER},
+ #else
+ 	/* force signature */
+-	{.action = APPRAISE, .fowner = GLOBAL_ROOT_UID,
++	{.action = APPRAISE, .fowner = GLOBAL_ROOT_UID, .fowner_op = &uid_eq,
+ 	 .flags = IMA_FOWNER | IMA_DIGSIG_REQUIRED},
+ #endif
+ };
+ 
++static struct ima_rule_entry build_appraise_rules[] __ro_after_init = {
++#ifdef CONFIG_IMA_APPRAISE_REQUIRE_MODULE_SIGS
++	{.action = APPRAISE, .func = MODULE_CHECK,
++	 .flags = IMA_FUNC | IMA_DIGSIG_REQUIRED},
++#endif
++#ifdef CONFIG_IMA_APPRAISE_REQUIRE_FIRMWARE_SIGS
++	{.action = APPRAISE, .func = FIRMWARE_CHECK,
++	 .flags = IMA_FUNC | IMA_DIGSIG_REQUIRED},
++#endif
++#ifdef CONFIG_IMA_APPRAISE_REQUIRE_KEXEC_SIGS
++	{.action = APPRAISE, .func = KEXEC_KERNEL_CHECK,
++	 .flags = IMA_FUNC | IMA_DIGSIG_REQUIRED},
++#endif
++#ifdef CONFIG_IMA_APPRAISE_REQUIRE_POLICY_SIGS
++	{.action = APPRAISE, .func = POLICY_CHECK,
++	 .flags = IMA_FUNC | IMA_DIGSIG_REQUIRED},
++#endif
++};
++
++static struct ima_rule_entry secure_boot_rules[] __ro_after_init = {
++	{.action = APPRAISE, .func = MODULE_CHECK,
++	 .flags = IMA_FUNC | IMA_DIGSIG_REQUIRED},
++	{.action = APPRAISE, .func = FIRMWARE_CHECK,
++	 .flags = IMA_FUNC | IMA_DIGSIG_REQUIRED},
++	{.action = APPRAISE, .func = KEXEC_KERNEL_CHECK,
++	 .flags = IMA_FUNC | IMA_DIGSIG_REQUIRED},
++	{.action = APPRAISE, .func = POLICY_CHECK,
++	 .flags = IMA_FUNC | IMA_DIGSIG_REQUIRED},
++};
++
+ static LIST_HEAD(ima_default_rules);
+ static LIST_HEAD(ima_policy_rules);
+ static LIST_HEAD(ima_temp_rules);
+@@ -164,22 +210,33 @@ static int __init default_measure_policy
+ }
+ __setup("ima_tcb", default_measure_policy_setup);
+ 
++static bool ima_use_appraise_tcb __initdata;
++static bool ima_use_secure_boot __initdata;
++static bool ima_fail_unverifiable_sigs __ro_after_init;
+ static int __init policy_setup(char *str)
+ {
+-	if (ima_policy)
+-		return 1;
++	char *p;
+ 
+-	if (strcmp(str, "tcb") == 0)
+-		ima_policy = DEFAULT_TCB;
++	while ((p = strsep(&str, " |\n")) != NULL) {
++		if (*p == ' ')
++			continue;
++		if ((strcmp(p, "tcb") == 0) && !ima_policy)
++			ima_policy = DEFAULT_TCB;
++		else if (strcmp(p, "appraise_tcb") == 0)
++			ima_use_appraise_tcb = true;
++		else if (strcmp(p, "secure_boot") == 0)
++			ima_use_secure_boot = true;
++		else if (strcmp(p, "fail_securely") == 0)
++			ima_fail_unverifiable_sigs = true;
++	}
+ 
+ 	return 1;
+ }
+ __setup("ima_policy=", policy_setup);
+ 
+-static bool ima_use_appraise_tcb __initdata;
+ static int __init default_appraise_policy_setup(char *str)
+ {
+-	ima_use_appraise_tcb = 1;
++	ima_use_appraise_tcb = true;
+ 	return 1;
+ }
+ __setup("ima_appraise_tcb", default_appraise_policy_setup);
+@@ -213,16 +270,17 @@ static void ima_lsm_update_rules(void)
+  * ima_match_rules - determine whether an inode matches the measure rule.
+  * @rule: a pointer to a rule
+  * @inode: a pointer to an inode
++ * @cred: a pointer to a credentials structure for user validation
++ * @secid: the secid of the task to be validated
+  * @func: LIM hook identifier
+  * @mask: requested action (MAY_READ | MAY_WRITE | MAY_APPEND | MAY_EXEC)
+  *
+  * Returns true on rule match, false on failure.
+  */
+ static bool ima_match_rules(struct ima_rule_entry *rule, struct inode *inode,
++			    const struct cred *cred, u32 secid,
+ 			    enum ima_hooks func, int mask)
+ {
+-	struct task_struct *tsk = current;
+-	const struct cred *cred = current_cred();
+ 	int i;
+ 
+ 	if ((rule->flags & IMA_FUNC) &&
+@@ -237,26 +295,30 @@ static bool ima_match_rules(struct ima_r
+ 	if ((rule->flags & IMA_FSMAGIC)
+ 	    && rule->fsmagic != inode->i_sb->s_magic)
+ 		return false;
++	if ((rule->flags & IMA_FSNAME)
++	    && strcmp(rule->fsname, inode->i_sb->s_type->name))
++		return false;
+ 	if ((rule->flags & IMA_FSUUID) &&
+-	    memcmp(rule->fsuuid, inode->i_sb->s_uuid, sizeof(rule->fsuuid)))
++	    !uuid_equal(&rule->fsuuid, &inode->i_sb->s_uuid))
+ 		return false;
+-	if ((rule->flags & IMA_UID) && !uid_eq(rule->uid, cred->uid))
++	if ((rule->flags & IMA_UID) && !rule->uid_op(cred->uid, rule->uid))
+ 		return false;
+ 	if (rule->flags & IMA_EUID) {
+ 		if (has_capability_noaudit(current, CAP_SETUID)) {
+-			if (!uid_eq(rule->uid, cred->euid)
+-			    && !uid_eq(rule->uid, cred->suid)
+-			    && !uid_eq(rule->uid, cred->uid))
++			if (!rule->uid_op(cred->euid, rule->uid)
++			    && !rule->uid_op(cred->suid, rule->uid)
++			    && !rule->uid_op(cred->uid, rule->uid))
+ 				return false;
+-		} else if (!uid_eq(rule->uid, cred->euid))
++		} else if (!rule->uid_op(cred->euid, rule->uid))
+ 			return false;
+ 	}
+ 
+-	if ((rule->flags & IMA_FOWNER) && !uid_eq(rule->fowner, inode->i_uid))
++	if ((rule->flags & IMA_FOWNER) &&
++	    !rule->fowner_op(inode->i_uid, rule->fowner))
+ 		return false;
+ 	for (i = 0; i < MAX_LSM_RULES; i++) {
+ 		int rc = 0;
+-		u32 osid, sid;
++		u32 osid;
+ 		int retried = 0;
+ 
+ 		if (!rule->lsm[i].rule)
+@@ -276,8 +338,7 @@ retry:
+ 		case LSM_SUBJ_USER:
+ 		case LSM_SUBJ_ROLE:
+ 		case LSM_SUBJ_TYPE:
+-			security_task_getsecid(tsk, &sid);
+-			rc = security_filter_rule_match(sid,
++			rc = security_filter_rule_match(secid,
+ 							rule->lsm[i].type,
+ 							Audit_equal,
+ 							rule->lsm[i].rule,
+@@ -310,6 +371,8 @@ static int get_subaction(struct ima_rule
+ 		return IMA_MMAP_APPRAISE;
+ 	case BPRM_CHECK:
+ 		return IMA_BPRM_APPRAISE;
++	case CREDS_CHECK:
++		return IMA_CREDS_APPRAISE;
+ 	case FILE_CHECK:
+ 	case POST_SETATTR:
+ 		return IMA_FILE_APPRAISE;
+@@ -322,6 +385,9 @@ static int get_subaction(struct ima_rule
+ /**
+  * ima_match_policy - decision based on LSM and other conditions
+  * @inode: pointer to an inode for which the policy decision is being made
++ * @cred: pointer to a credentials structure for which the policy decision is
++ *        being made
++ * @secid: LSM secid of the task to be validated
+  * @func: IMA hook identifier
+  * @mask: requested action (MAY_READ | MAY_WRITE | MAY_APPEND | MAY_EXEC)
+  * @pcr: set the pcr to extend
+@@ -333,8 +399,8 @@ static int get_subaction(struct ima_rule
+  * list when walking it.  Reads are many orders of magnitude more numerous
+  * than writes so ima_match_policy() is classical RCU candidate.
+  */
+-int ima_match_policy(struct inode *inode, enum ima_hooks func, int mask,
+-		     int flags, int *pcr)
++int ima_match_policy(struct inode *inode, const struct cred *cred, u32 secid,
++		     enum ima_hooks func, int mask, int flags, int *pcr)
+ {
+ 	struct ima_rule_entry *entry;
+ 	int action = 0, actmask = flags | (flags << 1);
+@@ -345,14 +411,18 @@ int ima_match_policy(struct inode *inode
+ 		if (!(entry->action & actmask))
+ 			continue;
+ 
+-		if (!ima_match_rules(entry, inode, func, mask))
++		if (!ima_match_rules(entry, inode, cred, secid, func, mask))
+ 			continue;
+ 
+ 		action |= entry->flags & IMA_ACTION_FLAGS;
+ 
+ 		action |= entry->action & IMA_DO_MASK;
+-		if (entry->action & IMA_APPRAISE)
++		if (entry->action & IMA_APPRAISE) {
+ 			action |= get_subaction(entry, func);
++			action &= ~IMA_HASH;
++			if (ima_fail_unverifiable_sigs)
++				action |= IMA_FAIL_UNVERIFIABLE_SIGS;
++		}
+ 
+ 		if (entry->action & IMA_DO_MASK)
+ 			actmask &= ~(entry->action | entry->action << 1);
+@@ -385,11 +455,24 @@ void ima_update_policy_flag(void)
+ 			ima_policy_flag |= entry->action;
+ 	}
+ 
+-	ima_appraise |= temp_ima_appraise;
++	ima_appraise |= (build_ima_appraise | temp_ima_appraise);
+ 	if (!ima_appraise)
+ 		ima_policy_flag &= ~IMA_APPRAISE;
+ }
+ 
++static int ima_appraise_flag(enum ima_hooks func)
++{
++	if (func == MODULE_CHECK)
++		return IMA_APPRAISE_MODULES;
++	else if (func == FIRMWARE_CHECK)
++		return IMA_APPRAISE_FIRMWARE;
++	else if (func == POLICY_CHECK)
++		return IMA_APPRAISE_POLICY;
++	else if (func == KEXEC_KERNEL_CHECK)
++		return IMA_APPRAISE_KEXEC;
++	return 0;
++}
++
+ /**
+  * ima_init_policy - initialize the default measure rules.
+  *
+@@ -398,12 +481,21 @@ void ima_update_policy_flag(void)
+  */
+ void __init ima_init_policy(void)
+ {
+-	int i, measure_entries, appraise_entries;
++	int i;
++	int measure_entries = 0;
++	int appraise_entries = 0;
++	int secure_boot_entries = 0;
++	bool kernel_locked_down = __kernel_is_locked_down(NULL, false);
+ 
+ 	/* if !ima_policy set entries = 0 so we load NO default rules */
+-	measure_entries = ima_policy ? ARRAY_SIZE(dont_measure_rules) : 0;
+-	appraise_entries = ima_use_appraise_tcb ?
+-			 ARRAY_SIZE(default_appraise_rules) : 0;
++	if (ima_policy)
++		measure_entries = ARRAY_SIZE(dont_measure_rules);
++
++	if (ima_use_appraise_tcb)
++		appraise_entries = ARRAY_SIZE(default_appraise_rules);
++
++	if (ima_use_secure_boot || kernel_locked_down)
++		secure_boot_entries = ARRAY_SIZE(secure_boot_rules);
+ 
+ 	for (i = 0; i < measure_entries; i++)
+ 		list_add_tail(&dont_measure_rules[i].list, &ima_default_rules);
+@@ -422,6 +514,49 @@ void __init ima_init_policy(void)
+ 		break;
+ 	}
+ 
++	/*
++	 * Insert the builtin "secure_boot" policy rules requiring file
++	 * signatures, prior to any other appraise rules.
++	 * In secure boot lock-down mode, also require these appraise
++	 * rules for custom policies.
++	 */
++	for (i = 0; i < secure_boot_entries; i++) {
++		struct ima_rule_entry *entry;
++
++		/* Include for builtin policies */
++		list_add_tail(&secure_boot_rules[i].list, &ima_default_rules);
++		temp_ima_appraise |=
++		    ima_appraise_flag(secure_boot_rules[i].func);
++
++		/* Include for custom policies */
++		if (kernel_locked_down) {
++			entry = kmemdup(&secure_boot_rules[i], sizeof(*entry),
++					GFP_KERNEL);
++			if (entry)
++				list_add_tail(&entry->list, &ima_policy_rules);
++		}
++	}
++
++	/*
++	 * Insert the build time appraise rules requiring file signatures
++	 * for both the initial and custom policies, prior to other appraise
++	 * rules.
++	 */
++	for (i = 0; i < ARRAY_SIZE(build_appraise_rules); i++) {
++		struct ima_rule_entry *entry;
++
++		if (!secure_boot_entries)
++			list_add_tail(&build_appraise_rules[i].list,
++				      &ima_default_rules);
++
++		entry = kmemdup(&build_appraise_rules[i], sizeof(*entry),
++				GFP_KERNEL);
++		if (entry)
++			list_add_tail(&entry->list, &ima_policy_rules);
++		build_ima_appraise |=
++			ima_appraise_flag(build_appraise_rules[i].func);
++	}
++
+ 	for (i = 0; i < appraise_entries; i++) {
+ 		list_add_tail(&default_appraise_rules[i].list,
+ 			      &ima_default_rules);
+@@ -454,22 +589,9 @@ int ima_check_policy(void)
+  */
+ void ima_update_policy(void)
+ {
+-	struct list_head *first, *last, *policy;
+-
+-	/* append current policy with the new rules */
+-	first = (&ima_temp_rules)->next;
+-	last = (&ima_temp_rules)->prev;
+-	policy = &ima_policy_rules;
+-
+-	synchronize_rcu();
+-
+-	last->next = policy;
+-	rcu_assign_pointer(list_next_rcu(policy->prev), first);
+-	first->prev = policy->prev;
+-	policy->prev = last;
++	struct list_head *policy = &ima_policy_rules;
+ 
+-	/* prepare for the next policy rules addition */
+-	INIT_LIST_HEAD(&ima_temp_rules);
++	list_splice_tail_init_rcu(&ima_temp_rules, policy, synchronize_rcu);
+ 
+ 	if (ima_rules != policy) {
+ 		ima_policy_flag = 0;
+@@ -482,11 +604,13 @@ enum {
+ 	Opt_err = -1,
+ 	Opt_measure = 1, Opt_dont_measure,
+ 	Opt_appraise, Opt_dont_appraise,
+-	Opt_audit,
++	Opt_audit, Opt_hash, Opt_dont_hash,
+ 	Opt_obj_user, Opt_obj_role, Opt_obj_type,
+ 	Opt_subj_user, Opt_subj_role, Opt_subj_type,
+-	Opt_func, Opt_mask, Opt_fsmagic,
+-	Opt_fsuuid, Opt_uid, Opt_euid, Opt_fowner,
++	Opt_func, Opt_mask, Opt_fsmagic, Opt_fsname,
++	Opt_fsuuid, Opt_uid_eq, Opt_euid_eq, Opt_fowner_eq,
++	Opt_uid_gt, Opt_euid_gt, Opt_fowner_gt,
++	Opt_uid_lt, Opt_euid_lt, Opt_fowner_lt,
+ 	Opt_appraise_type, Opt_permit_directio,
+ 	Opt_pcr
+ };
+@@ -497,6 +621,8 @@ static match_table_t policy_tokens = {
+ 	{Opt_appraise, "appraise"},
+ 	{Opt_dont_appraise, "dont_appraise"},
+ 	{Opt_audit, "audit"},
++	{Opt_hash, "hash"},
++	{Opt_dont_hash, "dont_hash"},
+ 	{Opt_obj_user, "obj_user=%s"},
+ 	{Opt_obj_role, "obj_role=%s"},
+ 	{Opt_obj_type, "obj_type=%s"},
+@@ -506,10 +632,17 @@ static match_table_t policy_tokens = {
+ 	{Opt_func, "func=%s"},
+ 	{Opt_mask, "mask=%s"},
+ 	{Opt_fsmagic, "fsmagic=%s"},
++	{Opt_fsname, "fsname=%s"},
+ 	{Opt_fsuuid, "fsuuid=%s"},
+-	{Opt_uid, "uid=%s"},
+-	{Opt_euid, "euid=%s"},
+-	{Opt_fowner, "fowner=%s"},
++	{Opt_uid_eq, "uid=%s"},
++	{Opt_euid_eq, "euid=%s"},
++	{Opt_fowner_eq, "fowner=%s"},
++	{Opt_uid_gt, "uid>%s"},
++	{Opt_euid_gt, "euid>%s"},
++	{Opt_fowner_gt, "fowner>%s"},
++	{Opt_uid_lt, "uid<%s"},
++	{Opt_euid_lt, "euid<%s"},
++	{Opt_fowner_lt, "fowner<%s"},
+ 	{Opt_appraise_type, "appraise_type=%s"},
+ 	{Opt_permit_directio, "permit_directio"},
+ 	{Opt_pcr, "pcr=%s"},
+@@ -541,11 +674,23 @@ static int ima_lsm_rule_init(struct ima_
+ 	return result;
+ }
+ 
++static void ima_log_string_op(struct audit_buffer *ab, char *key, char *value,
++			      bool (*rule_operator)(kuid_t, kuid_t))
++{
++	if (!ab)
++		return;
++
++	if (rule_operator == &uid_gt)
++		audit_log_format(ab, "%s>", key);
++	else if (rule_operator == &uid_lt)
++		audit_log_format(ab, "%s<", key);
++	else
++		audit_log_format(ab, "%s=", key);
++	audit_log_format(ab, "%s ", value);
++}
+ static void ima_log_string(struct audit_buffer *ab, char *key, char *value)
+ {
+-	audit_log_format(ab, "%s=", key);
+-	audit_log_untrustedstring(ab, value);
+-	audit_log_format(ab, " ");
++	ima_log_string_op(ab, key, value, NULL);
+ }
+ 
+ static int ima_parse_rule(char *rule, struct ima_rule_entry *entry)
+@@ -553,12 +698,16 @@ static int ima_parse_rule(char *rule, st
+ 	struct audit_buffer *ab;
+ 	char *from;
+ 	char *p;
++	bool uid_token;
+ 	int result = 0;
+ 
+-	ab = audit_log_start(NULL, GFP_KERNEL, AUDIT_INTEGRITY_RULE);
++	ab = integrity_audit_log_start(audit_context(), GFP_KERNEL,
++				       AUDIT_INTEGRITY_POLICY_RULE);
+ 
+ 	entry->uid = INVALID_UID;
+ 	entry->fowner = INVALID_UID;
++	entry->uid_op = &uid_eq;
++	entry->fowner_op = &uid_eq;
+ 	entry->action = UNKNOWN;
+ 	while ((p = strsep(&rule, " \t")) != NULL) {
+ 		substring_t args[MAX_OPT_ARGS];
+@@ -611,6 +760,22 @@ static int ima_parse_rule(char *rule, st
+ 
+ 			entry->action = AUDIT;
+ 			break;
++		case Opt_hash:
++			ima_log_string(ab, "action", "hash");
++
++			if (entry->action != UNKNOWN)
++				result = -EINVAL;
++
++			entry->action = HASH;
++			break;
++		case Opt_dont_hash:
++			ima_log_string(ab, "action", "dont_hash");
++
++			if (entry->action != UNKNOWN)
++				result = -EINVAL;
++
++			entry->action = DONT_HASH;
++			break;
+ 		case Opt_func:
+ 			ima_log_string(ab, "func", args[0].from);
+ 
+@@ -631,6 +796,8 @@ static int ima_parse_rule(char *rule, st
+ 				entry->func = MMAP_CHECK;
+ 			else if (strcmp(args[0].from, "BPRM_CHECK") == 0)
+ 				entry->func = BPRM_CHECK;
++			else if (strcmp(args[0].from, "CREDS_CHECK") == 0)
++				entry->func = CREDS_CHECK;
+ 			else if (strcmp(args[0].from, "KEXEC_KERNEL_CHECK") ==
+ 				 0)
+ 				entry->func = KEXEC_KERNEL_CHECK;
+@@ -680,25 +847,44 @@ static int ima_parse_rule(char *rule, st
+ 			if (!result)
+ 				entry->flags |= IMA_FSMAGIC;
+ 			break;
++		case Opt_fsname:
++			ima_log_string(ab, "fsname", args[0].from);
++
++			entry->fsname = kstrdup(args[0].from, GFP_KERNEL);
++			if (!entry->fsname) {
++				result = -ENOMEM;
++				break;
++			}
++			result = 0;
++			entry->flags |= IMA_FSNAME;
++			break;
+ 		case Opt_fsuuid:
+ 			ima_log_string(ab, "fsuuid", args[0].from);
+ 
+-			if (memchr_inv(entry->fsuuid, 0x00,
+-				       sizeof(entry->fsuuid))) {
++			if (!uuid_is_null(&entry->fsuuid)) {
+ 				result = -EINVAL;
+ 				break;
+ 			}
+ 
+-			result = blk_part_pack_uuid(args[0].from,
+-						    entry->fsuuid);
++			result = uuid_parse(args[0].from, &entry->fsuuid);
+ 			if (!result)
+ 				entry->flags |= IMA_FSUUID;
+ 			break;
+-		case Opt_uid:
+-			ima_log_string(ab, "uid", args[0].from);
+-		case Opt_euid:
+-			if (token == Opt_euid)
+-				ima_log_string(ab, "euid", args[0].from);
++		case Opt_uid_gt:
++		case Opt_euid_gt:
++			entry->uid_op = &uid_gt;
++		case Opt_uid_lt:
++		case Opt_euid_lt:
++			if ((token == Opt_uid_lt) || (token == Opt_euid_lt))
++				entry->uid_op = &uid_lt;
++		case Opt_uid_eq:
++		case Opt_euid_eq:
++			uid_token = (token == Opt_uid_eq) ||
++				    (token == Opt_uid_gt) ||
++				    (token == Opt_uid_lt);
++
++			ima_log_string_op(ab, uid_token ? "uid" : "euid",
++					  args[0].from, entry->uid_op);
+ 
+ 			if (uid_valid(entry->uid)) {
+ 				result = -EINVAL;
+@@ -713,12 +899,18 @@ static int ima_parse_rule(char *rule, st
+ 				    (uid_t)lnum != lnum)
+ 					result = -EINVAL;
+ 				else
+-					entry->flags |= (token == Opt_uid)
++					entry->flags |= uid_token
+ 					    ? IMA_UID : IMA_EUID;
+ 			}
+ 			break;
+-		case Opt_fowner:
+-			ima_log_string(ab, "fowner", args[0].from);
++		case Opt_fowner_gt:
++			entry->fowner_op = &uid_gt;
++		case Opt_fowner_lt:
++			if (token == Opt_fowner_lt)
++				entry->fowner_op = &uid_lt;
++		case Opt_fowner_eq:
++			ima_log_string_op(ab, "fowner", args[0].from,
++					  entry->fowner_op);
+ 
+ 			if (uid_valid(entry->fowner)) {
+ 				result = -EINVAL;
+@@ -807,12 +999,9 @@ static int ima_parse_rule(char *rule, st
+ 	}
+ 	if (!result && (entry->action == UNKNOWN))
+ 		result = -EINVAL;
+-	else if (entry->func == MODULE_CHECK)
+-		temp_ima_appraise |= IMA_APPRAISE_MODULES;
+-	else if (entry->func == FIRMWARE_CHECK)
+-		temp_ima_appraise |= IMA_APPRAISE_FIRMWARE;
+-	else if (entry->func == POLICY_CHECK)
+-		temp_ima_appraise |= IMA_APPRAISE_POLICY;
++	else if (entry->action == APPRAISE)
++		temp_ima_appraise |= ima_appraise_flag(entry->func);
++
+ 	audit_log_format(ab, "res=%d", !result);
+ 	audit_log_end(ab);
+ 	return result;
+@@ -889,30 +1078,17 @@ enum {
+ 	mask_exec = 0, mask_write, mask_read, mask_append
+ };
+ 
+-static char *mask_tokens[] = {
+-	"MAY_EXEC",
+-	"MAY_WRITE",
+-	"MAY_READ",
+-	"MAY_APPEND"
++static const char *const mask_tokens[] = {
++	"^MAY_EXEC",
++	"^MAY_WRITE",
++	"^MAY_READ",
++	"^MAY_APPEND"
+ };
+ 
+-enum {
+-	func_file = 0, func_mmap, func_bprm,
+-	func_module, func_firmware, func_post,
+-	func_kexec_kernel, func_kexec_initramfs,
+-	func_policy
+-};
++#define __ima_hook_stringify(str)	(#str),
+ 
+-static char *func_tokens[] = {
+-	"FILE_CHECK",
+-	"MMAP_CHECK",
+-	"BPRM_CHECK",
+-	"MODULE_CHECK",
+-	"FIRMWARE_CHECK",
+-	"POST_SETATTR",
+-	"KEXEC_KERNEL_CHECK",
+-	"KEXEC_INITRAMFS_CHECK",
+-	"POLICY_CHECK"
++static const char *const func_tokens[] = {
++	__ima_hooks(__ima_hook_stringify)
+ };
+ 
+ void *ima_policy_start(struct seq_file *m, loff_t *pos)
+@@ -949,49 +1125,16 @@ void ima_policy_stop(struct seq_file *m,
+ 
+ #define pt(token)	policy_tokens[token + Opt_err].pattern
+ #define mt(token)	mask_tokens[token]
+-#define ft(token)	func_tokens[token]
+ 
+ /*
+  * policy_func_show - display the ima_hooks policy rule
+  */
+ static void policy_func_show(struct seq_file *m, enum ima_hooks func)
+ {
+-	char tbuf[64] = {0,};
+-
+-	switch (func) {
+-	case FILE_CHECK:
+-		seq_printf(m, pt(Opt_func), ft(func_file));
+-		break;
+-	case MMAP_CHECK:
+-		seq_printf(m, pt(Opt_func), ft(func_mmap));
+-		break;
+-	case BPRM_CHECK:
+-		seq_printf(m, pt(Opt_func), ft(func_bprm));
+-		break;
+-	case MODULE_CHECK:
+-		seq_printf(m, pt(Opt_func), ft(func_module));
+-		break;
+-	case FIRMWARE_CHECK:
+-		seq_printf(m, pt(Opt_func), ft(func_firmware));
+-		break;
+-	case POST_SETATTR:
+-		seq_printf(m, pt(Opt_func), ft(func_post));
+-		break;
+-	case KEXEC_KERNEL_CHECK:
+-		seq_printf(m, pt(Opt_func), ft(func_kexec_kernel));
+-		break;
+-	case KEXEC_INITRAMFS_CHECK:
+-		seq_printf(m, pt(Opt_func), ft(func_kexec_initramfs));
+-		break;
+-	case POLICY_CHECK:
+-		seq_printf(m, pt(Opt_func), ft(func_policy));
+-		break;
+-	default:
+-		snprintf(tbuf, sizeof(tbuf), "%d", func);
+-		seq_printf(m, pt(Opt_func), tbuf);
+-		break;
+-	}
+-	seq_puts(m, " ");
++	if (func > 0 && func < MAX_CHECK)
++		seq_printf(m, "func=%s ", func_tokens[func]);
++	else
++		seq_printf(m, "func=%d ", func);
+ }
+ 
+ int ima_policy_show(struct seq_file *m, void *v)
+@@ -999,6 +1142,7 @@ int ima_policy_show(struct seq_file *m,
+ 	struct ima_rule_entry *entry = v;
+ 	int i;
+ 	char tbuf[64] = {0,};
++	int offset = 0;
+ 
+ 	rcu_read_lock();
+ 
+@@ -1012,21 +1156,27 @@ int ima_policy_show(struct seq_file *m,
+ 		seq_puts(m, pt(Opt_dont_appraise));
+ 	if (entry->action & AUDIT)
+ 		seq_puts(m, pt(Opt_audit));
++	if (entry->action & HASH)
++		seq_puts(m, pt(Opt_hash));
++	if (entry->action & DONT_HASH)
++		seq_puts(m, pt(Opt_dont_hash));
+ 
+ 	seq_puts(m, " ");
+ 
+ 	if (entry->flags & IMA_FUNC)
+ 		policy_func_show(m, entry->func);
+ 
+-	if (entry->flags & IMA_MASK) {
++	if ((entry->flags & IMA_MASK) || (entry->flags & IMA_INMASK)) {
++		if (entry->flags & IMA_MASK)
++			offset = 1;
+ 		if (entry->mask & MAY_EXEC)
+-			seq_printf(m, pt(Opt_mask), mt(mask_exec));
++			seq_printf(m, pt(Opt_mask), mt(mask_exec) + offset);
+ 		if (entry->mask & MAY_WRITE)
+-			seq_printf(m, pt(Opt_mask), mt(mask_write));
++			seq_printf(m, pt(Opt_mask), mt(mask_write) + offset);
+ 		if (entry->mask & MAY_READ)
+-			seq_printf(m, pt(Opt_mask), mt(mask_read));
++			seq_printf(m, pt(Opt_mask), mt(mask_read) + offset);
+ 		if (entry->mask & MAY_APPEND)
+-			seq_printf(m, pt(Opt_mask), mt(mask_append));
++			seq_printf(m, pt(Opt_mask), mt(mask_append) + offset);
+ 		seq_puts(m, " ");
+ 	}
+ 
+@@ -1036,6 +1186,12 @@ int ima_policy_show(struct seq_file *m,
+ 		seq_puts(m, " ");
+ 	}
+ 
++	if (entry->flags & IMA_FSNAME) {
++		snprintf(tbuf, sizeof(tbuf), "%s", entry->fsname);
++		seq_printf(m, pt(Opt_fsname), tbuf);
++		seq_puts(m, " ");
++	}
++
+ 	if (entry->flags & IMA_PCR) {
+ 		snprintf(tbuf, sizeof(tbuf), "%d", entry->pcr);
+ 		seq_printf(m, pt(Opt_pcr), tbuf);
+@@ -1043,25 +1199,40 @@ int ima_policy_show(struct seq_file *m,
+ 	}
+ 
+ 	if (entry->flags & IMA_FSUUID) {
+-		seq_printf(m, "fsuuid=%pU", entry->fsuuid);
++		seq_printf(m, "fsuuid=%pU", &entry->fsuuid);
+ 		seq_puts(m, " ");
+ 	}
+ 
+ 	if (entry->flags & IMA_UID) {
+ 		snprintf(tbuf, sizeof(tbuf), "%d", __kuid_val(entry->uid));
+-		seq_printf(m, pt(Opt_uid), tbuf);
++		if (entry->uid_op == &uid_gt)
++			seq_printf(m, pt(Opt_uid_gt), tbuf);
++		else if (entry->uid_op == &uid_lt)
++			seq_printf(m, pt(Opt_uid_lt), tbuf);
++		else
++			seq_printf(m, pt(Opt_uid_eq), tbuf);
+ 		seq_puts(m, " ");
+ 	}
+ 
+ 	if (entry->flags & IMA_EUID) {
+ 		snprintf(tbuf, sizeof(tbuf), "%d", __kuid_val(entry->uid));
+-		seq_printf(m, pt(Opt_euid), tbuf);
++		if (entry->uid_op == &uid_gt)
++			seq_printf(m, pt(Opt_euid_gt), tbuf);
++		else if (entry->uid_op == &uid_lt)
++			seq_printf(m, pt(Opt_euid_lt), tbuf);
++		else
++			seq_printf(m, pt(Opt_euid_eq), tbuf);
+ 		seq_puts(m, " ");
+ 	}
+ 
+ 	if (entry->flags & IMA_FOWNER) {
+ 		snprintf(tbuf, sizeof(tbuf), "%d", __kuid_val(entry->fowner));
+-		seq_printf(m, pt(Opt_fowner), tbuf);
++		if (entry->fowner_op == &uid_gt)
++			seq_printf(m, pt(Opt_fowner_gt), tbuf);
++		else if (entry->fowner_op == &uid_lt)
++			seq_printf(m, pt(Opt_fowner_lt), tbuf);
++		else
++			seq_printf(m, pt(Opt_fowner_eq), tbuf);
+ 		seq_puts(m, " ");
+ 	}
+ 
+diff -Nurp 4.9.0/integrity/ima/ima_queue.c 4.19.98/integrity/ima/ima_queue.c
+--- 4.9.0/integrity/ima/ima_queue.c	2020-03-14 21:09:21.993540503 +0800
++++ 4.19.98/integrity/ima/ima_queue.c	2020-03-14 20:52:04.881839999 +0800
+@@ -29,6 +29,11 @@
+ #define AUDIT_CAUSE_LEN_MAX 32
+ 
+ LIST_HEAD(ima_measurements);	/* list of all measurements */
++#ifdef CONFIG_IMA_KEXEC
++static unsigned long binary_runtime_size;
++#else
++static unsigned long binary_runtime_size = ULONG_MAX;
++#endif
+ 
+ /* key: inode (before secure-hashing a file) */
+ struct ima_h_table ima_htable = {
+@@ -64,12 +69,32 @@ static struct ima_queue_entry *ima_looku
+ 	return ret;
+ }
+ 
++/*
++ * Calculate the memory required for serializing a single
++ * binary_runtime_measurement list entry, which contains a
++ * couple of variable length fields (e.g template name and data).
++ */
++static int get_binary_runtime_size(struct ima_template_entry *entry)
++{
++	int size = 0;
++
++	size += sizeof(u32);	/* pcr */
++	size += sizeof(entry->digest);
++	size += sizeof(int);	/* template name size field */
++	size += strlen(entry->template_desc->name);
++	size += sizeof(entry->template_data_len);
++	size += entry->template_data_len;
++	return size;
++}
++
+ /* ima_add_template_entry helper function:
+- * - Add template entry to measurement list and hash table.
++ * - Add template entry to the measurement list and hash table, for
++ *   all entries except those carried across kexec.
+  *
+  * (Called with ima_extend_list_mutex held.)
+  */
+-static int ima_add_digest_entry(struct ima_template_entry *entry)
++static int ima_add_digest_entry(struct ima_template_entry *entry,
++				bool update_htable)
+ {
+ 	struct ima_queue_entry *qe;
+ 	unsigned int key;
+@@ -85,26 +110,54 @@ static int ima_add_digest_entry(struct i
+ 	list_add_tail_rcu(&qe->later, &ima_measurements);
+ 
+ 	atomic_long_inc(&ima_htable.len);
+-	key = ima_hash_key(entry->digest);
+-	hlist_add_head_rcu(&qe->hnext, &ima_htable.queue[key]);
++	if (update_htable) {
++		key = ima_hash_key(entry->digest);
++		hlist_add_head_rcu(&qe->hnext, &ima_htable.queue[key]);
++	}
++
++	if (binary_runtime_size != ULONG_MAX) {
++		int size;
++
++		size = get_binary_runtime_size(entry);
++		binary_runtime_size = (binary_runtime_size < ULONG_MAX - size) ?
++		     binary_runtime_size + size : ULONG_MAX;
++	}
+ 	return 0;
+ }
+ 
++/*
++ * Return the amount of memory required for serializing the
++ * entire binary_runtime_measurement list, including the ima_kexec_hdr
++ * structure.
++ */
++unsigned long ima_get_binary_runtime_size(void)
++{
++	if (binary_runtime_size >= (ULONG_MAX - sizeof(struct ima_kexec_hdr)))
++		return ULONG_MAX;
++	else
++		return binary_runtime_size + sizeof(struct ima_kexec_hdr);
++};
++
+ static int ima_pcr_extend(const u8 *hash, int pcr)
+ {
+ 	int result = 0;
+ 
+-	if (!ima_used_chip)
++	if (!ima_tpm_chip)
+ 		return result;
+ 
+-	result = tpm_pcr_extend(TPM_ANY_NUM, pcr, hash);
++	result = tpm_pcr_extend(ima_tpm_chip, pcr, hash);
+ 	if (result != 0)
+ 		pr_err("Error Communicating to TPM chip, result: %d\n", result);
+ 	return result;
+ }
+ 
+-/* Add template entry to the measurement list and hash table,
+- * and extend the pcr.
++/*
++ * Add template entry to the measurement list and hash table, and
++ * extend the pcr.
++ *
++ * On systems which support carrying the IMA measurement list across
++ * kexec, maintain the total memory size required for serializing the
++ * binary_runtime_measurements.
+  */
+ int ima_add_template_entry(struct ima_template_entry *entry, int violation,
+ 			   const char *op, struct inode *inode,
+@@ -126,7 +179,7 @@ int ima_add_template_entry(struct ima_te
+ 		}
+ 	}
+ 
+-	result = ima_add_digest_entry(entry);
++	result = ima_add_digest_entry(entry, 1);
+ 	if (result < 0) {
+ 		audit_cause = "ENOMEM";
+ 		audit_info = 0;
+@@ -149,3 +202,13 @@ out:
+ 			    op, audit_cause, result, audit_info);
+ 	return result;
+ }
++
++int ima_restore_measurement_entry(struct ima_template_entry *entry)
++{
++	int result = 0;
++
++	mutex_lock(&ima_extend_list_mutex);
++	result = ima_add_digest_entry(entry, 0);
++	mutex_unlock(&ima_extend_list_mutex);
++	return result;
++}
+diff -Nurp 4.9.0/integrity/ima/ima_template.c 4.19.98/integrity/ima/ima_template.c
+--- 4.9.0/integrity/ima/ima_template.c	2020-03-14 21:09:21.993540503 +0800
++++ 4.19.98/integrity/ima/ima_template.c	2020-03-14 20:52:04.881839999 +0800
+@@ -15,16 +15,23 @@
+ 
+ #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+ 
++#include <linux/rculist.h>
+ #include "ima.h"
+ #include "ima_template_lib.h"
+ 
+-static struct ima_template_desc defined_templates[] = {
++enum header_fields { HDR_PCR, HDR_DIGEST, HDR_TEMPLATE_NAME,
++		     HDR_TEMPLATE_DATA, HDR__LAST };
++
++static struct ima_template_desc builtin_templates[] = {
+ 	{.name = IMA_TEMPLATE_IMA_NAME, .fmt = IMA_TEMPLATE_IMA_FMT},
+ 	{.name = "ima-ng", .fmt = "d-ng|n-ng"},
+ 	{.name = "ima-sig", .fmt = "d-ng|n-ng|sig"},
+ 	{.name = "", .fmt = ""},	/* placeholder for a custom format */
+ };
+ 
++static LIST_HEAD(defined_templates);
++static DEFINE_SPINLOCK(template_list);
++
+ static struct ima_template_field supported_fields[] = {
+ 	{.field_id = "d", .field_init = ima_eventdigest_init,
+ 	 .field_show = ima_show_template_digest},
+@@ -37,6 +44,7 @@ static struct ima_template_field support
+ 	{.field_id = "sig", .field_init = ima_eventsig_init,
+ 	 .field_show = ima_show_template_sig},
+ };
++#define MAX_TEMPLATE_NAME_LEN 15
+ 
+ static struct ima_template_desc *ima_template;
+ static struct ima_template_desc *lookup_template_desc(const char *name);
+@@ -52,6 +60,8 @@ static int __init ima_template_setup(cha
+ 	if (ima_template)
+ 		return 1;
+ 
++	ima_init_template_list();
++
+ 	/*
+ 	 * Verify that a template with the supplied name exists.
+ 	 * If not, use CONFIG_IMA_DEFAULT_TEMPLATE.
+@@ -80,7 +90,7 @@ __setup("ima_template=", ima_template_se
+ 
+ static int __init ima_template_fmt_setup(char *str)
+ {
+-	int num_templates = ARRAY_SIZE(defined_templates);
++	int num_templates = ARRAY_SIZE(builtin_templates);
+ 
+ 	if (ima_template)
+ 		return 1;
+@@ -91,22 +101,28 @@ static int __init ima_template_fmt_setup
+ 		return 1;
+ 	}
+ 
+-	defined_templates[num_templates - 1].fmt = str;
+-	ima_template = defined_templates + num_templates - 1;
++	builtin_templates[num_templates - 1].fmt = str;
++	ima_template = builtin_templates + num_templates - 1;
++
+ 	return 1;
+ }
+ __setup("ima_template_fmt=", ima_template_fmt_setup);
+ 
+ static struct ima_template_desc *lookup_template_desc(const char *name)
+ {
+-	int i;
++	struct ima_template_desc *template_desc;
++	int found = 0;
+ 
+-	for (i = 0; i < ARRAY_SIZE(defined_templates); i++) {
+-		if (strcmp(defined_templates[i].name, name) == 0)
+-			return defined_templates + i;
++	rcu_read_lock();
++	list_for_each_entry_rcu(template_desc, &defined_templates, list) {
++		if ((strcmp(template_desc->name, name) == 0) ||
++		    (strcmp(template_desc->fmt, name) == 0)) {
++			found = 1;
++			break;
++		}
+ 	}
+-
+-	return NULL;
++	rcu_read_unlock();
++	return found ? template_desc : NULL;
+ }
+ 
+ static struct ima_template_field *lookup_template_field(const char *field_id)
+@@ -142,9 +158,14 @@ static int template_desc_init_fields(con
+ {
+ 	const char *template_fmt_ptr;
+ 	struct ima_template_field *found_fields[IMA_TEMPLATE_NUM_FIELDS_MAX];
+-	int template_num_fields = template_fmt_size(template_fmt);
++	int template_num_fields;
+ 	int i, len;
+ 
++	if (num_fields && *num_fields > 0) /* already initialized? */
++		return 0;
++
++	template_num_fields = template_fmt_size(template_fmt);
++
+ 	if (template_num_fields > IMA_TEMPLATE_NUM_FIELDS_MAX) {
+ 		pr_err("format string '%s' contains too many fields\n",
+ 		       template_fmt);
+@@ -182,11 +203,28 @@ static int template_desc_init_fields(con
+ 	return 0;
+ }
+ 
++void ima_init_template_list(void)
++{
++	int i;
++
++	if (!list_empty(&defined_templates))
++		return;
++
++	spin_lock(&template_list);
++	for (i = 0; i < ARRAY_SIZE(builtin_templates); i++) {
++		list_add_tail_rcu(&builtin_templates[i].list,
++				  &defined_templates);
++	}
++	spin_unlock(&template_list);
++}
++
+ struct ima_template_desc *ima_template_desc_current(void)
+ {
+-	if (!ima_template)
++	if (!ima_template) {
++		ima_init_template_list();
+ 		ima_template =
+ 		    lookup_template_desc(CONFIG_IMA_DEFAULT_TEMPLATE);
++	}
+ 	return ima_template;
+ }
+ 
+@@ -205,3 +243,193 @@ int __init ima_init_template(void)
+ 
+ 	return result;
+ }
++
++static struct ima_template_desc *restore_template_fmt(char *template_name)
++{
++	struct ima_template_desc *template_desc = NULL;
++	int ret;
++
++	ret = template_desc_init_fields(template_name, NULL, NULL);
++	if (ret < 0) {
++		pr_err("attempting to initialize the template \"%s\" failed\n",
++			template_name);
++		goto out;
++	}
++
++	template_desc = kzalloc(sizeof(*template_desc), GFP_KERNEL);
++	if (!template_desc)
++		goto out;
++
++	template_desc->name = "";
++	template_desc->fmt = kstrdup(template_name, GFP_KERNEL);
++	if (!template_desc->fmt)
++		goto out;
++
++	spin_lock(&template_list);
++	list_add_tail_rcu(&template_desc->list, &defined_templates);
++	spin_unlock(&template_list);
++out:
++	return template_desc;
++}
++
++static int ima_restore_template_data(struct ima_template_desc *template_desc,
++				     void *template_data,
++				     int template_data_size,
++				     struct ima_template_entry **entry)
++{
++	int ret = 0;
++	int i;
++
++	*entry = kzalloc(sizeof(**entry) +
++		    template_desc->num_fields * sizeof(struct ima_field_data),
++		    GFP_NOFS);
++	if (!*entry)
++		return -ENOMEM;
++
++	ret = ima_parse_buf(template_data, template_data + template_data_size,
++			    NULL, template_desc->num_fields,
++			    (*entry)->template_data, NULL, NULL,
++			    ENFORCE_FIELDS | ENFORCE_BUFEND, "template data");
++	if (ret < 0) {
++		kfree(*entry);
++		return ret;
++	}
++
++	(*entry)->template_desc = template_desc;
++	for (i = 0; i < template_desc->num_fields; i++) {
++		struct ima_field_data *field_data = &(*entry)->template_data[i];
++		u8 *data = field_data->data;
++
++		(*entry)->template_data[i].data =
++			kzalloc(field_data->len + 1, GFP_KERNEL);
++		if (!(*entry)->template_data[i].data) {
++			ret = -ENOMEM;
++			break;
++		}
++		memcpy((*entry)->template_data[i].data, data, field_data->len);
++		(*entry)->template_data_len += sizeof(field_data->len);
++		(*entry)->template_data_len += field_data->len;
++	}
++
++	if (ret < 0) {
++		ima_free_template_entry(*entry);
++		*entry = NULL;
++	}
++
++	return ret;
++}
++
++/* Restore the serialized binary measurement list without extending PCRs. */
++int ima_restore_measurement_list(loff_t size, void *buf)
++{
++	char template_name[MAX_TEMPLATE_NAME_LEN];
++
++	struct ima_kexec_hdr *khdr = buf;
++	struct ima_field_data hdr[HDR__LAST] = {
++		[HDR_PCR] = {.len = sizeof(u32)},
++		[HDR_DIGEST] = {.len = TPM_DIGEST_SIZE},
++	};
++
++	void *bufp = buf + sizeof(*khdr);
++	void *bufendp;
++	struct ima_template_entry *entry;
++	struct ima_template_desc *template_desc;
++	DECLARE_BITMAP(hdr_mask, HDR__LAST);
++	unsigned long count = 0;
++	int ret = 0;
++
++	if (!buf || size < sizeof(*khdr))
++		return 0;
++
++	if (ima_canonical_fmt) {
++		khdr->version = le16_to_cpu(khdr->version);
++		khdr->count = le64_to_cpu(khdr->count);
++		khdr->buffer_size = le64_to_cpu(khdr->buffer_size);
++	}
++
++	if (khdr->version != 1) {
++		pr_err("attempting to restore a incompatible measurement list");
++		return -EINVAL;
++	}
++
++	if (khdr->count > ULONG_MAX - 1) {
++		pr_err("attempting to restore too many measurements");
++		return -EINVAL;
++	}
++
++	bitmap_zero(hdr_mask, HDR__LAST);
++	bitmap_set(hdr_mask, HDR_PCR, 1);
++	bitmap_set(hdr_mask, HDR_DIGEST, 1);
++
++	/*
++	 * ima kexec buffer prefix: version, buffer size, count
++	 * v1 format: pcr, digest, template-name-len, template-name,
++	 *	      template-data-size, template-data
++	 */
++	bufendp = buf + khdr->buffer_size;
++	while ((bufp < bufendp) && (count++ < khdr->count)) {
++		int enforce_mask = ENFORCE_FIELDS;
++
++		enforce_mask |= (count == khdr->count) ? ENFORCE_BUFEND : 0;
++		ret = ima_parse_buf(bufp, bufendp, &bufp, HDR__LAST, hdr, NULL,
++				    hdr_mask, enforce_mask, "entry header");
++		if (ret < 0)
++			break;
++
++		if (hdr[HDR_TEMPLATE_NAME].len >= MAX_TEMPLATE_NAME_LEN) {
++			pr_err("attempting to restore a template name that is too long\n");
++			ret = -EINVAL;
++			break;
++		}
++
++		/* template name is not null terminated */
++		memcpy(template_name, hdr[HDR_TEMPLATE_NAME].data,
++		       hdr[HDR_TEMPLATE_NAME].len);
++		template_name[hdr[HDR_TEMPLATE_NAME].len] = 0;
++
++		if (strcmp(template_name, "ima") == 0) {
++			pr_err("attempting to restore an unsupported template \"%s\" failed\n",
++			       template_name);
++			ret = -EINVAL;
++			break;
++		}
++
++		template_desc = lookup_template_desc(template_name);
++		if (!template_desc) {
++			template_desc = restore_template_fmt(template_name);
++			if (!template_desc)
++				break;
++		}
++
++		/*
++		 * Only the running system's template format is initialized
++		 * on boot.  As needed, initialize the other template formats.
++		 */
++		ret = template_desc_init_fields(template_desc->fmt,
++						&(template_desc->fields),
++						&(template_desc->num_fields));
++		if (ret < 0) {
++			pr_err("attempting to restore the template fmt \"%s\" failed\n",
++			       template_desc->fmt);
++			ret = -EINVAL;
++			break;
++		}
++
++		ret = ima_restore_template_data(template_desc,
++						hdr[HDR_TEMPLATE_DATA].data,
++						hdr[HDR_TEMPLATE_DATA].len,
++						&entry);
++		if (ret < 0)
++			break;
++
++		memcpy(entry->digest, hdr[HDR_DIGEST].data,
++		       hdr[HDR_DIGEST].len);
++		entry->pcr = !ima_canonical_fmt ? *(hdr[HDR_PCR].data) :
++			     le32_to_cpu(*(hdr[HDR_PCR].data));
++		ret = ima_restore_measurement_entry(entry);
++		if (ret < 0)
++			break;
++
++	}
++	return ret;
++}
+diff -Nurp 4.9.0/integrity/ima/ima_template_lib.c 4.19.98/integrity/ima/ima_template_lib.c
+--- 4.9.0/integrity/ima/ima_template_lib.c	2020-03-14 21:09:21.993540503 +0800
++++ 4.19.98/integrity/ima/ima_template_lib.c	2020-03-14 20:52:04.881839999 +0800
+@@ -13,6 +13,8 @@
+  *      Library of supported template fields.
+  */
+ 
++#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
++
+ #include "ima_template_lib.h"
+ 
+ static bool ima_template_hash_algo_allowed(u8 algo)
+@@ -103,8 +105,11 @@ static void ima_show_template_data_binar
+ 	u32 len = (show == IMA_SHOW_BINARY_OLD_STRING_FMT) ?
+ 	    strlen(field_data->data) : field_data->len;
+ 
+-	if (show != IMA_SHOW_BINARY_NO_FIELD_LEN)
+-		ima_putc(m, &len, sizeof(len));
++	if (show != IMA_SHOW_BINARY_NO_FIELD_LEN) {
++		u32 field_len = !ima_canonical_fmt ? len : cpu_to_le32(len);
++
++		ima_putc(m, &field_len, sizeof(field_len));
++	}
+ 
+ 	if (!len)
+ 		return;
+@@ -156,6 +161,67 @@ void ima_show_template_sig(struct seq_fi
+ 	ima_show_template_field_data(m, show, DATA_FMT_HEX, field_data);
+ }
+ 
++/**
++ * ima_parse_buf() - Parses lengths and data from an input buffer
++ * @bufstartp:       Buffer start address.
++ * @bufendp:         Buffer end address.
++ * @bufcurp:         Pointer to remaining (non-parsed) data.
++ * @maxfields:       Length of fields array.
++ * @fields:          Array containing lengths and pointers of parsed data.
++ * @curfields:       Number of array items containing parsed data.
++ * @len_mask:        Bitmap (if bit is set, data length should not be parsed).
++ * @enforce_mask:    Check if curfields == maxfields and/or bufcurp == bufendp.
++ * @bufname:         String identifier of the input buffer.
++ *
++ * Return: 0 on success, -EINVAL on error.
++ */
++int ima_parse_buf(void *bufstartp, void *bufendp, void **bufcurp,
++		  int maxfields, struct ima_field_data *fields, int *curfields,
++		  unsigned long *len_mask, int enforce_mask, char *bufname)
++{
++	void *bufp = bufstartp;
++	int i;
++
++	for (i = 0; i < maxfields; i++) {
++		if (len_mask == NULL || !test_bit(i, len_mask)) {
++			if (bufp > (bufendp - sizeof(u32)))
++				break;
++
++			fields[i].len = *(u32 *)bufp;
++			if (ima_canonical_fmt)
++				fields[i].len = le32_to_cpu(fields[i].len);
++
++			bufp += sizeof(u32);
++		}
++
++		if (bufp > (bufendp - fields[i].len))
++			break;
++
++		fields[i].data = bufp;
++		bufp += fields[i].len;
++	}
++
++	if ((enforce_mask & ENFORCE_FIELDS) && i != maxfields) {
++		pr_err("%s: nr of fields mismatch: expected: %d, current: %d\n",
++		       bufname, maxfields, i);
++		return -EINVAL;
++	}
++
++	if ((enforce_mask & ENFORCE_BUFEND) && bufp != bufendp) {
++		pr_err("%s: buf end mismatch: expected: %p, current: %p\n",
++		       bufname, bufendp, bufp);
++		return -EINVAL;
++	}
++
++	if (curfields)
++		*curfields = i;
++
++	if (bufcurp)
++		*bufcurp = bufp;
++
++	return 0;
++}
++
+ static int ima_eventdigest_init_common(u8 *digest, u32 digestsize, u8 hash_algo,
+ 				       struct ima_field_data *field_data)
+ {
+@@ -314,16 +380,11 @@ int ima_eventname_ng_init(struct ima_eve
+ int ima_eventsig_init(struct ima_event_data *event_data,
+ 		      struct ima_field_data *field_data)
+ {
+-	enum data_formats fmt = DATA_FMT_HEX;
+ 	struct evm_ima_xattr_data *xattr_value = event_data->xattr_value;
+-	int xattr_len = event_data->xattr_len;
+-	int rc = 0;
+ 
+ 	if ((!xattr_value) || (xattr_value->type != EVM_IMA_XATTR_DIGSIG))
+-		goto out;
++		return 0;
+ 
+-	rc = ima_write_template_field_data(xattr_value, xattr_len, fmt,
+-					   field_data);
+-out:
+-	return rc;
++	return ima_write_template_field_data(xattr_value, event_data->xattr_len,
++					     DATA_FMT_HEX, field_data);
+ }
+diff -Nurp 4.9.0/integrity/ima/ima_template_lib.h 4.19.98/integrity/ima/ima_template_lib.h
+--- 4.9.0/integrity/ima/ima_template_lib.h	2020-03-14 21:09:21.993540503 +0800
++++ 4.19.98/integrity/ima/ima_template_lib.h	2020-03-14 20:52:04.881839999 +0800
+@@ -18,6 +18,9 @@
+ #include <linux/seq_file.h>
+ #include "ima.h"
+ 
++#define ENFORCE_FIELDS 0x00000001
++#define ENFORCE_BUFEND 0x00000002
++
+ void ima_show_template_digest(struct seq_file *m, enum ima_show_type show,
+ 			      struct ima_field_data *field_data);
+ void ima_show_template_digest_ng(struct seq_file *m, enum ima_show_type show,
+@@ -26,6 +29,9 @@ void ima_show_template_string(struct seq
+ 			      struct ima_field_data *field_data);
+ void ima_show_template_sig(struct seq_file *m, enum ima_show_type show,
+ 			   struct ima_field_data *field_data);
++int ima_parse_buf(void *bufstartp, void *bufendp, void **bufcurp,
++		  int maxfields, struct ima_field_data *fields, int *curfields,
++		  unsigned long *len_mask, int enforce_mask, char *bufname);
+ int ima_eventdigest_init(struct ima_event_data *event_data,
+ 			 struct ima_field_data *field_data);
+ int ima_eventname_init(struct ima_event_data *event_data,
+diff -Nurp 4.9.0/integrity/ima/Kconfig 4.19.98/integrity/ima/Kconfig
+--- 4.9.0/integrity/ima/Kconfig	2020-03-14 21:09:21.993540503 +0800
++++ 4.19.98/integrity/ima/Kconfig	2020-03-14 20:52:04.881839999 +0800
+@@ -10,7 +10,9 @@ config IMA
+ 	select CRYPTO_HASH_INFO
+ 	select TCG_TPM if HAS_IOMEM && !UML
+ 	select TCG_TIS if TCG_TPM && X86
++	select TCG_CRB if TCG_TPM && ACPI
+ 	select TCG_IBMVTPM if TCG_TPM && PPC_PSERIES
++	select INTEGRITY_AUDIT if AUDIT
+ 	help
+ 	  The Trusted Computing Group(TCG) runtime Integrity
+ 	  Measurement Architecture(IMA) maintains a list of hash
+@@ -27,6 +29,18 @@ config IMA
+ 	  to learn more about IMA.
+ 	  If unsure, say N.
+ 
++config IMA_KEXEC
++	bool "Enable carrying the IMA measurement list across a soft boot"
++	depends on IMA && TCG_TPM && HAVE_IMA_KEXEC
++	default n
++	help
++	   TPM PCRs are only reset on a hard reboot.  In order to validate
++	   a TPM's quote after a soft boot, the IMA measurement list of the
++	   running kernel must be saved and restored on boot.
++
++	   Depending on the IMA policy, the measurement list can grow to
++	   be very large.
++
+ config IMA_MEASURE_PCR_IDX
+ 	int
+ 	depends on IMA
+@@ -84,19 +98,19 @@ choice
+ 
+ 	config IMA_DEFAULT_HASH_SHA1
+ 		bool "SHA1 (default)"
+-		depends on CRYPTO_SHA1
++		depends on CRYPTO_SHA1=y
+ 
+ 	config IMA_DEFAULT_HASH_SHA256
+ 		bool "SHA256"
+-		depends on CRYPTO_SHA256 && !IMA_TEMPLATE
++		depends on CRYPTO_SHA256=y && !IMA_TEMPLATE
+ 
+ 	config IMA_DEFAULT_HASH_SHA512
+ 		bool "SHA512"
+-		depends on CRYPTO_SHA512 && !IMA_TEMPLATE
++		depends on CRYPTO_SHA512=y && !IMA_TEMPLATE
+ 
+ 	config IMA_DEFAULT_HASH_WP512
+ 		bool "WP512"
+-		depends on CRYPTO_WP512 && !IMA_TEMPLATE
++		depends on CRYPTO_WP512=y && !IMA_TEMPLATE
+ endchoice
+ 
+ config IMA_DEFAULT_HASH
+@@ -143,6 +157,72 @@ config IMA_APPRAISE
+ 	  <http://linux-ima.sourceforge.net>
+ 	  If unsure, say N.
+ 
++config IMA_APPRAISE_BUILD_POLICY
++	bool "IMA build time configured policy rules"
++	depends on IMA_APPRAISE && INTEGRITY_ASYMMETRIC_KEYS
++	default n
++	help
++	  This option defines an IMA appraisal policy at build time, which
++	  is enforced at run time without having to specify a builtin
++	  policy name on the boot command line.  The build time appraisal
++	  policy rules persist after loading a custom policy.
++
++	  Depending on the rules configured, this policy may require kernel
++	  modules, firmware, the kexec kernel image, and/or the IMA policy
++	  to be signed.  Unsigned files might prevent the system from
++	  booting or applications from working properly.
++
++config IMA_APPRAISE_REQUIRE_FIRMWARE_SIGS
++	bool "Appraise firmware signatures"
++	depends on IMA_APPRAISE_BUILD_POLICY
++	default n
++	help
++	  This option defines a policy requiring all firmware to be signed,
++	  including the regulatory.db.  If both this option and
++	  CFG80211_REQUIRE_SIGNED_REGDB are enabled, then both signature
++	  verification methods are necessary.
++
++config IMA_APPRAISE_REQUIRE_KEXEC_SIGS
++	bool "Appraise kexec kernel image signatures"
++	depends on IMA_APPRAISE_BUILD_POLICY
++	default n
++	help
++	  Enabling this rule will require all kexec'ed kernel images to
++	  be signed and verified by a public key on the trusted IMA
++	  keyring.
++
++	  Kernel image signatures can not be verified by the original
++	  kexec_load syscall.  Enabling this rule will prevent its
++	  usage.
++
++config IMA_APPRAISE_REQUIRE_MODULE_SIGS
++	bool "Appraise kernel modules signatures"
++	depends on IMA_APPRAISE_BUILD_POLICY
++	default n
++	help
++	  Enabling this rule will require all kernel modules to be signed
++	  and verified by a public key on the trusted IMA keyring.
++
++	  Kernel module signatures can only be verified by IMA-appraisal,
++	  via the finit_module syscall. Enabling this rule will prevent
++	  the usage of the init_module syscall.
++
++config IMA_APPRAISE_REQUIRE_POLICY_SIGS
++	bool "Appraise IMA policy signature"
++	depends on IMA_APPRAISE_BUILD_POLICY
++	default n
++	help
++	  Enabling this rule will require the IMA policy to be signed and
++	  and verified by a key on the trusted IMA keyring.
++
++config IMA_APPRAISE_BOOTPARAM
++	bool "ima_appraise boot parameter"
++	depends on IMA_APPRAISE
++	default y
++	help
++	  This option enables the different "ima_appraise=" modes
++	  (eg. fix, log) from the boot command line.
++
+ config IMA_TRUSTED_KEYRING
+ 	bool "Require all keys on the .ima keyring be signed (deprecated)"
+ 	depends on IMA_APPRAISE && SYSTEM_TRUSTED_KEYRING
+diff -Nurp 4.9.0/integrity/ima/Makefile 4.19.98/integrity/ima/Makefile
+--- 4.9.0/integrity/ima/Makefile	2020-03-14 21:09:21.993540503 +0800
++++ 4.19.98/integrity/ima/Makefile	2020-03-14 20:52:04.881839999 +0800
+@@ -1,3 +1,4 @@
++# SPDX-License-Identifier: GPL-2.0
+ #
+ # Makefile for building Trusted Computing Group's(TCG) runtime Integrity
+ # Measurement Architecture(IMA).
+@@ -8,4 +9,5 @@ obj-$(CONFIG_IMA) += ima.o
+ ima-y := ima_fs.o ima_queue.o ima_init.o ima_main.o ima_crypto.o ima_api.o \
+ 	 ima_policy.o ima_template.o ima_template_lib.o
+ ima-$(CONFIG_IMA_APPRAISE) += ima_appraise.o
++ima-$(CONFIG_HAVE_IMA_KEXEC) += ima_kexec.o
+ obj-$(CONFIG_IMA_BLACKLIST_KEYRING) += ima_mok.o
+diff -Nurp 4.9.0/integrity/integrity_audit.c 4.19.98/integrity/integrity_audit.c
+--- 4.9.0/integrity/integrity_audit.c	2020-03-14 21:09:21.993540503 +0800
++++ 4.19.98/integrity/integrity_audit.c	2020-03-14 20:52:04.881839999 +0800
+@@ -38,18 +38,14 @@ void integrity_audit_msg(int audit_msgno
+ 	if (!integrity_audit_info && audit_info == 1)	/* Skip info messages */
+ 		return;
+ 
+-	ab = audit_log_start(current->audit_context, GFP_KERNEL, audit_msgno);
++	ab = audit_log_start(audit_context(), GFP_KERNEL, audit_msgno);
+ 	audit_log_format(ab, "pid=%d uid=%u auid=%u ses=%u",
+ 			 task_pid_nr(current),
+ 			 from_kuid(&init_user_ns, current_cred()->uid),
+ 			 from_kuid(&init_user_ns, audit_get_loginuid(current)),
+ 			 audit_get_sessionid(current));
+ 	audit_log_task_context(ab);
+-	audit_log_format(ab, " op=");
+-	audit_log_string(ab, op);
+-	audit_log_format(ab, " cause=");
+-	audit_log_string(ab, cause);
+-	audit_log_format(ab, " comm=");
++	audit_log_format(ab, " op=%s cause=%s comm=", op, cause);
+ 	audit_log_untrustedstring(ab, get_task_comm(name, current));
+ 	if (fname) {
+ 		audit_log_format(ab, " name=");
+diff -Nurp 4.9.0/integrity/integrity.h 4.19.98/integrity/integrity.h
+--- 4.9.0/integrity/integrity.h	2020-03-14 21:09:21.993540503 +0800
++++ 4.19.98/integrity/integrity.h	2020-03-14 20:52:04.881839999 +0800
+@@ -15,6 +15,7 @@
+ #include <linux/integrity.h>
+ #include <crypto/sha.h>
+ #include <linux/key.h>
++#include <linux/audit.h>
+ 
+ /* iint action cache flags */
+ #define IMA_MEASURE		0x00000001
+@@ -25,39 +26,54 @@
+ #define IMA_COLLECTED		0x00000020
+ #define IMA_AUDIT		0x00000040
+ #define IMA_AUDITED		0x00000080
++#define IMA_HASH		0x00000100
++#define IMA_HASHED		0x00000200
+ 
+ /* iint cache flags */
+ #define IMA_ACTION_FLAGS	0xff000000
+-#define IMA_ACTION_RULE_FLAGS	0x06000000
+-#define IMA_DIGSIG		0x01000000
+-#define IMA_DIGSIG_REQUIRED	0x02000000
+-#define IMA_PERMIT_DIRECTIO	0x04000000
+-#define IMA_NEW_FILE		0x08000000
++#define IMA_DIGSIG_REQUIRED	0x01000000
++#define IMA_PERMIT_DIRECTIO	0x02000000
++#define IMA_NEW_FILE		0x04000000
++#define EVM_IMMUTABLE_DIGSIG	0x08000000
++#define IMA_FAIL_UNVERIFIABLE_SIGS	0x10000000
+ 
+ #define IMA_DO_MASK		(IMA_MEASURE | IMA_APPRAISE | IMA_AUDIT | \
+-				 IMA_APPRAISE_SUBMASK)
++				 IMA_HASH | IMA_APPRAISE_SUBMASK)
+ #define IMA_DONE_MASK		(IMA_MEASURED | IMA_APPRAISED | IMA_AUDITED | \
+-				 IMA_COLLECTED | IMA_APPRAISED_SUBMASK)
++				 IMA_HASHED | IMA_COLLECTED | \
++				 IMA_APPRAISED_SUBMASK)
+ 
+ /* iint subaction appraise cache flags */
+-#define IMA_FILE_APPRAISE	0x00000100
+-#define IMA_FILE_APPRAISED	0x00000200
+-#define IMA_MMAP_APPRAISE	0x00000400
+-#define IMA_MMAP_APPRAISED	0x00000800
+-#define IMA_BPRM_APPRAISE	0x00001000
+-#define IMA_BPRM_APPRAISED	0x00002000
+-#define IMA_READ_APPRAISE	0x00004000
+-#define IMA_READ_APPRAISED	0x00008000
++#define IMA_FILE_APPRAISE	0x00001000
++#define IMA_FILE_APPRAISED	0x00002000
++#define IMA_MMAP_APPRAISE	0x00004000
++#define IMA_MMAP_APPRAISED	0x00008000
++#define IMA_BPRM_APPRAISE	0x00010000
++#define IMA_BPRM_APPRAISED	0x00020000
++#define IMA_READ_APPRAISE	0x00040000
++#define IMA_READ_APPRAISED	0x00080000
++#define IMA_CREDS_APPRAISE	0x00100000
++#define IMA_CREDS_APPRAISED	0x00200000
+ #define IMA_APPRAISE_SUBMASK	(IMA_FILE_APPRAISE | IMA_MMAP_APPRAISE | \
+-				 IMA_BPRM_APPRAISE | IMA_READ_APPRAISE)
++				 IMA_BPRM_APPRAISE | IMA_READ_APPRAISE | \
++				 IMA_CREDS_APPRAISE)
+ #define IMA_APPRAISED_SUBMASK	(IMA_FILE_APPRAISED | IMA_MMAP_APPRAISED | \
+-				 IMA_BPRM_APPRAISED | IMA_READ_APPRAISED)
++				 IMA_BPRM_APPRAISED | IMA_READ_APPRAISED | \
++				 IMA_CREDS_APPRAISED)
++
++/* iint cache atomic_flags */
++#define IMA_CHANGE_XATTR	0
++#define IMA_UPDATE_XATTR	1
++#define IMA_CHANGE_ATTR		2
++#define IMA_DIGSIG		3
++#define IMA_MUST_MEASURE	4
+ 
+ enum evm_ima_xattr_type {
+ 	IMA_XATTR_DIGEST = 0x01,
+ 	EVM_XATTR_HMAC,
+ 	EVM_IMA_XATTR_DIGSIG,
+ 	IMA_XATTR_DIGEST_NG,
++	EVM_XATTR_PORTABLE_DIGSIG,
+ 	IMA_XATTR_LAST
+ };
+ 
+@@ -92,22 +108,25 @@ struct signature_v2_hdr {
+ 	uint8_t type;		/* xattr type */
+ 	uint8_t version;	/* signature format version */
+ 	uint8_t	hash_algo;	/* Digest algorithm [enum hash_algo] */
+-	uint32_t keyid;		/* IMA key identifier - not X509/PGP specific */
+-	uint16_t sig_size;	/* signature size */
++	__be32 keyid;		/* IMA key identifier - not X509/PGP specific */
++	__be16 sig_size;	/* signature size */
+ 	uint8_t sig[0];		/* signature payload */
+ } __packed;
+ 
+ /* integrity data associated with an inode */
+ struct integrity_iint_cache {
+ 	struct rb_node rb_node;	/* rooted in integrity_iint_tree */
++	struct mutex mutex;	/* protects: version, flags, digest */
+ 	struct inode *inode;	/* back pointer to inode in question */
+ 	u64 version;		/* track inode changes */
+ 	unsigned long flags;
+ 	unsigned long measured_pcrs;
++	unsigned long atomic_flags;
+ 	enum integrity_status ima_file_status:4;
+ 	enum integrity_status ima_mmap_status:4;
+ 	enum integrity_status ima_bprm_status:4;
+ 	enum integrity_status ima_read_status:4;
++	enum integrity_status ima_creds_status:4;
+ 	enum integrity_status evm_status:4;
+ 	struct ima_digest_data *ima_hash;
+ };
+@@ -118,14 +137,15 @@ struct integrity_iint_cache {
+ struct integrity_iint_cache *integrity_iint_find(struct inode *inode);
+ 
+ int integrity_kernel_read(struct file *file, loff_t offset,
+-			  char *addr, unsigned long count);
+-int __init integrity_read_file(const char *path, char **data);
++			  void *addr, unsigned long count);
+ 
+ #define INTEGRITY_KEYRING_EVM		0
+ #define INTEGRITY_KEYRING_IMA		1
+ #define INTEGRITY_KEYRING_MODULE	2
+ #define INTEGRITY_KEYRING_MAX		3
+ 
++extern struct dentry *integrity_dir;
++
+ #ifdef CONFIG_INTEGRITY_SIGNATURE
+ 
+ int integrity_digsig_verify(const unsigned int id, const char *sig, int siglen,
+@@ -180,6 +200,13 @@ static inline void evm_load_x509(void)
+ void integrity_audit_msg(int audit_msgno, struct inode *inode,
+ 			 const unsigned char *fname, const char *op,
+ 			 const char *cause, int result, int info);
++
++static inline struct audit_buffer *
++integrity_audit_log_start(struct audit_context *ctx, gfp_t gfp_mask, int type)
++{
++	return audit_log_start(ctx, gfp_mask, type);
++}
++
+ #else
+ static inline void integrity_audit_msg(int audit_msgno, struct inode *inode,
+ 				       const unsigned char *fname,
+@@ -187,4 +214,11 @@ static inline void integrity_audit_msg(i
+ 				       int result, int info)
+ {
+ }
++
++static inline struct audit_buffer *
++integrity_audit_log_start(struct audit_context *ctx, gfp_t gfp_mask, int type)
++{
++	return NULL;
++}
++
+ #endif
+diff -Nurp 4.9.0/integrity/Makefile 4.19.98/integrity/Makefile
+--- 4.9.0/integrity/Makefile	2020-03-14 21:09:21.993540503 +0800
++++ 4.19.98/integrity/Makefile	2020-03-14 20:52:04.881839999 +0800
+@@ -1,3 +1,4 @@
++# SPDX-License-Identifier: GPL-2.0
+ #
+ # Makefile for caching inode integrity data (iint)
+ #
